@@ -1,7 +1,11 @@
-# VPSサーバーセットアップ手順
+# VPSサーバーセットアップ手順（IP直接接続版）
 
 Ubuntu 24.04 LTS を前提とした、tunnel-server の環境構築手順。
+ドメインやTLSを使わず、IPアドレスで直接接続する簡易構成。
 rootでSSHログインした状態から開始する。
+
+> **注意**: この構成ではWebSocket通信が平文（ws://）のため、経路上での盗聴・改ざんのリスクがある。
+> セキュアな構成が必要な場合は [vps-setup-secure.md](vps-setup-secure.md) を参照すること。
 
 ## 1. システム更新
 
@@ -70,8 +74,8 @@ chmod +x ~/tunnel-sever/tunnel-server
 ## 7. ファイアウォール設定
 
 ```bash
-sudo ufw allow 22/tcp          # SSH
-sudo ufw allow 8080/tcp        # 制御チャネル
+sudo ufw allow 22/tcp           # SSH
+sudo ufw allow 8080/tcp         # 制御チャネル（WebSocket）
 sudo ufw allow 49152:49200/tcp  # クライアントが使う公開ポート範囲
 sudo ufw enable
 ```
@@ -122,5 +126,3 @@ tunnel-client.exe -server ws://<VPS-IP>:8080 -public 49152 -local localhost:4915
 ```
 
 VPS側のログに `tunnel client connected` と表示されれば成功。
-
-.\tunnel-client.exe -server ws://133.88.121.25:8080 -public 49152 -local localhost:49152
