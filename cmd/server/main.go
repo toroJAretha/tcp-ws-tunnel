@@ -15,6 +15,7 @@ func main() {
 	controlAddr := flag.String("control", ":8080", "クライアントが接続するHTTP/WSアドレス")
 	portMin := flag.Int("port-min", 49152, "ランダムポート割り当て範囲の下限")
 	portMax := flag.Int("port-max", 65535, "ランダムポート割り当て範囲の上限")
+	jwtSecret := flag.String("secret", "", "JWT署名検証用のHMAC秘密鍵（未設定の場合は認証なし）")
 	flag.Parse()
 
 	if *portMin < 1 || *portMax > 65535 || *portMin > *portMax {
@@ -29,6 +30,7 @@ func main() {
 		ControlAddr: *controlAddr,
 		PortMin:     *portMin,
 		PortMax:     *portMax,
+		JWTSecret:   *jwtSecret,
 	}
 
 	log.SetFlags(log.LstdFlags | log.Lshortfile)

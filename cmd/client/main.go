@@ -14,6 +14,7 @@ func main() {
 	// コマンドライン引数の定義
 	serverURL := flag.String("server", "", "トンネルサーバーのWebSocket URL（例: wss://tunnel.example.com）")
 	localAddr := flag.String("local", "localhost:25565", "転送先のローカルアドレス")
+	authToken := flag.String("token", "", "サーバー認証用の事前共有トークン")
 	flag.Parse()
 
 	// 必須パラメータのバリデーション
@@ -28,6 +29,7 @@ func main() {
 	c := &client.Client{
 		ServerURL: *serverURL,
 		LocalAddr: *localAddr,
+		AuthToken: *authToken,
 	}
 
 	log.SetFlags(log.LstdFlags | log.Lshortfile)

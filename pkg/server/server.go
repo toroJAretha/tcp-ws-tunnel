@@ -7,9 +7,11 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 	"github.com/toroJ/port-tunnel/pkg/protocol"
 )
@@ -41,6 +43,7 @@ type Server struct {
 	ControlAddr string // HTTP/WSリッスンアドレス（例: ":8080"）
 	PortMin     int    // ランダムポート割り当て範囲の下限
 	PortMax     int    // ランダムポート割り当て範囲の上限
+	JWTSecret   string // JWT署名検証用のHMAC秘密鍵（空の場合は認証なし）
 
 	mu      sync.Mutex
 	tunnels map[int]*tunnel         // 公開ポート番号をキーとしたトンネルマップ
@@ -55,9 +58,17 @@ func (s *Server) Run(ctx context.Context) error {
 	// HTTPルーティングの設定
 	mux := http.NewServeMux()
 	mux.HandleFunc("/control", func(w http.ResponseWriter, r *http.Request) {
+		if !s.authenticate(w, r) {
+			return
+		}
 		s.handleControl(ctx, w, r)
 	})
-	mux.HandleFunc("/data", s.handleData)
+	mux.HandleFunc("/data", func(w http.ResponseWriter, r *http.Request) {
+		if !s.authenticate(w, r) {
+			return
+		}
+		s.handleData(w, r)
+	})
 
 	httpServer := &http.Server{
 		Addr:    s.ControlAddr,
@@ -112,6 +123,35 @@ func (s *Server) allocatePort() (int, net.Listener, error) {
 	}
 
 	return 0, nil, fmt.Errorf("no available port in range %d-%d", s.PortMin, s.PortMax)
+}
+
+// authenticate はリクエストのAuthorizationヘッダーのJWTを検証する。
+// JWTSecret未設定の場合は常に許可する。接続時のみ検証し、接続中は再検証しない。
+func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) bool {
+	if s.JWTSecret == "" {
+		return true
+	}
+	auth := r.Header.Get("Authorization")
+	tokenStr := strings.TrimPrefix(auth, "Bearer ")
+	if tokenStr == "" || tokenStr == auth {
+		log.Printf("[server] missing token from %s", r.RemoteAddr)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return false
+	}
+
+	token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+		}
+		return []byte(s.JWTSecret), nil
+	})
+	if err != nil || !token.Valid {
+		log.Printf("[server] invalid token from %s: %v", r.RemoteAddr, err)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return false
+	}
+
+	return true
 }
 
 // handleControl はクライアントからの制御チャネル接続を処理する。

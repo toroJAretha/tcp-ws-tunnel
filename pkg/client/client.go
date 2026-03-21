@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"net/url"
 	"sync"
 	"time"
@@ -17,6 +18,7 @@ import (
 type Client struct {
 	ServerURL string // トンネルサーバーのWebSocket URL（例: "wss://tunnel.example.com"）
 	LocalAddr string // 転送先のローカルアドレス（例: "localhost:49152"）
+	AuthToken string // サーバー認証用の事前共有トークン（空の場合は認証なし）
 }
 
 // Run はクライアントを起動する。コンテキストがキャンセルされるまでブロックし、
@@ -54,13 +56,23 @@ func (c *Client) Run(ctx context.Context) error {
 	}
 }
 
+// authHeader は認証用のHTTPヘッダーを返す。トークン未設定の場合はnilを返す。
+func (c *Client) authHeader() http.Header {
+	if c.AuthToken == "" {
+		return nil
+	}
+	h := http.Header{}
+	h.Set("Authorization", "Bearer "+c.AuthToken)
+	return h
+}
+
 // connect はサーバーとの制御チャネルを確立し、メッセージの受信ループを実行する。
 func (c *Client) connect(ctx context.Context) error {
 	// 制御チャネルに接続
 	controlURL := c.ServerURL + "/control"
 	log.Printf("[client] connecting to %s", controlURL)
 
-	ws, _, err := websocket.DefaultDialer.DialContext(ctx, controlURL, nil)
+	ws, _, err := websocket.DefaultDialer.DialContext(ctx, controlURL, c.authHeader())
 	if err != nil {
 		return fmt.Errorf("dial control: %w", err)
 	}
@@ -135,7 +147,7 @@ func (c *Client) handleNewConnection(ctx context.Context, connID string) error {
 
 	// サーバーとのデータチャネルを開設
 	dataURL := c.ServerURL + "/data?id=" + url.QueryEscape(connID)
-	ws, _, err := websocket.DefaultDialer.DialContext(ctx, dataURL, nil)
+	ws, _, err := websocket.DefaultDialer.DialContext(ctx, dataURL, c.authHeader())
 	if err != nil {
 		localConn.Close()
 		return fmt.Errorf("dial data channel: %w", err)
