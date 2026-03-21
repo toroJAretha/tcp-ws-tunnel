@@ -15,9 +15,8 @@ import (
 
 // Client はトンネルサーバーに接続し、トラフィックをローカルサービスに転送するクライアント。
 type Client struct {
-	ServerURL  string // トンネルサーバーのWebSocket URL（例: "ws://vps:8080"）
-	PublicPort int    // サーバー側で公開するポート番号
-	LocalAddr  string // 転送先のローカルアドレス（例: "localhost:49152"）
+	ServerURL string // トンネルサーバーのWebSocket URL（例: "wss://tunnel.example.com"）
+	LocalAddr string // 転送先のローカルアドレス（例: "localhost:49152"）
 }
 
 // Run はクライアントを起動する。コンテキストがキャンセルされるまでブロックし、
@@ -57,8 +56,8 @@ func (c *Client) Run(ctx context.Context) error {
 
 // connect はサーバーとの制御チャネルを確立し、メッセージの受信ループを実行する。
 func (c *Client) connect(ctx context.Context) error {
-	// 公開ポートを指定して制御チャネルに接続
-	controlURL := fmt.Sprintf("%s/control?port=%d", c.ServerURL, c.PublicPort)
+	// 制御チャネルに接続
+	controlURL := c.ServerURL + "/control"
 	log.Printf("[client] connecting to %s", controlURL)
 
 	ws, _, err := websocket.DefaultDialer.DialContext(ctx, controlURL, nil)
@@ -81,6 +80,12 @@ func (c *Client) connect(ctx context.Context) error {
 		return ws.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(5*time.Second))
 	})
 
+	// コンテキストがキャンセルされたらWebSocket接続を閉じて読み取りループを抜ける
+	go func() {
+		<-ctx.Done()
+		ws.Close()
+	}()
+
 	// 全データチャネルの終了を待つためのWaitGroup
 	var wg sync.WaitGroup
 	defer wg.Wait()
@@ -96,6 +101,10 @@ func (c *Client) connect(ctx context.Context) error {
 		}
 
 		switch msg.Type {
+		case protocol.TypePortAssigned:
+			// サーバーから割り当てられたポート番号を表示
+			log.Printf("[client] assigned public port: %d", msg.Port)
+
 		case protocol.TypeNewConnection:
 			// 新しい外部接続を受信 → goroutineでデータチャネルを処理
 			wg.Add(1)

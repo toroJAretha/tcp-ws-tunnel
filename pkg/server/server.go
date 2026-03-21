@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
-	"strconv"
 	"sync"
 	"time"
 
@@ -39,6 +39,8 @@ type tunnel struct {
 // 複数のクライアントが同時に異なるポートでトンネルを作成できる。
 type Server struct {
 	ControlAddr string // HTTP/WSリッスンアドレス（例: ":8080"）
+	PortMin     int    // ランダムポート割り当て範囲の下限
+	PortMax     int    // ランダムポート割り当て範囲の上限
 
 	mu      sync.Mutex
 	tunnels map[int]*tunnel         // 公開ポート番号をキーとしたトンネルマップ
@@ -71,28 +73,50 @@ func (s *Server) Run(ctx context.Context) error {
 		httpServer.Shutdown(context.Background())
 	}()
 
-	log.Printf("[server] control channel: %s (multi-tenant mode)", s.ControlAddr)
+	// ファイアウォールのカスタムチェーンを初期化
+	if err := initFirewall(s.PortMin, s.PortMax); err != nil {
+		log.Printf("[server] firewall initialization failed (continuing without firewall): %v", err)
+	} else {
+		// サーバー終了時にファイアウォールをクリーンアップ
+		defer cleanupFirewall(s.PortMin, s.PortMax)
+	}
+
+	log.Printf("[server] control channel: %s, port range: %d-%d", s.ControlAddr, s.PortMin, s.PortMax)
 	if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
 		return fmt.Errorf("http server: %w", err)
 	}
 	return nil
 }
 
-// handleControl はクライアントからの制御チャネル接続を処理する。
-// クエリパラメータ ?port= で指定されたポートのTCPリスナーを動的に作成する。
-func (s *Server) handleControl(ctx context.Context, w http.ResponseWriter, r *http.Request) {
-	// ポート番号のバリデーション
-	portStr := r.URL.Query().Get("port")
-	if portStr == "" {
-		http.Error(w, "missing port parameter (e.g., /control?port=49152)", http.StatusBadRequest)
-		return
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil || port < 1 || port > 65535 {
-		http.Error(w, "invalid port number", http.StatusBadRequest)
-		return
+// allocatePort はポート範囲内から未使用のランダムポートを割り当てる。
+// 空きがない場合はエラーを返す。
+func (s *Server) allocatePort() (int, net.Listener, error) {
+	portRange := s.PortMax - s.PortMin + 1
+
+	// ランダムな開始位置から順に空きポートを探す
+	start := rand.Intn(portRange)
+	for i := 0; i < portRange; i++ {
+		port := s.PortMin + (start+i)%portRange
+
+		if _, exists := s.tunnels[port]; exists {
+			continue
+		}
+
+		listenAddr := fmt.Sprintf(":%d", port)
+		listener, err := net.Listen("tcp", listenAddr)
+		if err != nil {
+			continue // OSレベルで使用中の場合はスキップ
+		}
+
+		return port, listener, nil
 	}
 
+	return 0, nil, fmt.Errorf("no available port in range %d-%d", s.PortMin, s.PortMax)
+}
+
+// handleControl はクライアントからの制御チャネル接続を処理する。
+// ランダムなポートを割り当て、クライアントに通知する。
+func (s *Server) handleControl(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	// HTTPからWebSocketへアップグレード
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -100,26 +124,14 @@ func (s *Server) handleControl(ctx context.Context, w http.ResponseWriter, r *ht
 		return
 	}
 
-	// 指定ポートが既に他のトンネルで使用されていないか確認
+	// ランダムポートを割り当て
 	s.mu.Lock()
-	if _, exists := s.tunnels[port]; exists {
-		s.mu.Unlock()
-		ws.WriteMessage(websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.ClosePolicyViolation,
-				fmt.Sprintf("port %d is already in use by another client", port)))
-		ws.Close()
-		return
-	}
-	s.mu.Unlock()
-
-	// 指定ポートでTCPリスナーを起動
-	listenAddr := fmt.Sprintf(":%d", port)
-	listener, err := net.Listen("tcp", listenAddr)
+	port, listener, err := s.allocatePort()
 	if err != nil {
-		log.Printf("[server] failed to listen on %s: %v", listenAddr, err)
+		s.mu.Unlock()
+		log.Printf("[server] port allocation failed: %v", err)
 		ws.WriteMessage(websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseInternalServerErr,
-				fmt.Sprintf("cannot listen on port %d: %v", port, err)))
+			websocket.FormatCloseMessage(websocket.CloseInternalServerErr, err.Error()))
 		ws.Close()
 		return
 	}
@@ -134,22 +146,32 @@ func (s *Server) handleControl(ctx context.Context, w http.ResponseWriter, r *ht
 		listener:   listener,
 	}
 
-	// トンネルをマップに登録（リスナー作成後に再度重複チェック）
-	s.mu.Lock()
-	if _, exists := s.tunnels[port]; exists {
-		s.mu.Unlock()
-		tunnelCancel()
-		listener.Close()
-		ws.WriteMessage(websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.ClosePolicyViolation,
-				fmt.Sprintf("port %d is already in use by another client", port)))
-		ws.Close()
-		return
-	}
 	s.tunnels[port] = t
 	s.mu.Unlock()
 
-	log.Printf("[server] tunnel client connected from %s, public port :%d", r.RemoteAddr, port)
+	// ファイアウォールでポートを開放
+	if err := openPort(port); err != nil {
+		log.Printf("[server] firewall open failed (port %d): %v", port, err)
+	}
+
+	// 割り当てたポートをクライアントに通知
+	t.controlMu.Lock()
+	err = ws.WriteJSON(protocol.ControlMessage{
+		Type: protocol.TypePortAssigned,
+		Port: port,
+	})
+	t.controlMu.Unlock()
+	if err != nil {
+		tunnelCancel()
+		listener.Close()
+		s.mu.Lock()
+		delete(s.tunnels, port)
+		s.mu.Unlock()
+		ws.Close()
+		return
+	}
+
+	log.Printf("[server] tunnel client connected from %s, assigned port :%d", r.RemoteAddr, port)
 
 	// このトンネルのTCP接続受付を開始
 	go s.acceptTCP(tunnelCtx, listener, t)
@@ -158,6 +180,11 @@ func (s *Server) handleControl(ctx context.Context, w http.ResponseWriter, r *ht
 	defer func() {
 		tunnelCancel()
 		listener.Close()
+
+		// ファイアウォールでポートを閉鎖
+		if err := closePort(port); err != nil {
+			log.Printf("[server] firewall close failed (port %d): %v", port, err)
+		}
 
 		s.mu.Lock()
 		// トンネルをマップから削除

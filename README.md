@@ -5,30 +5,31 @@ HTTP(WebSocket)を使ったTCPトンネリングツール。ルーターのポ�
 ## 仕組み
 
 ```
-[外部クライアント] → [公開サーバー:<PORT>] ⟷ WebSocket ⟷ [自宅PC] → [localhost:<PORT>]
+[外部クライアント] → [公開サーバー:<ランダムポート>] ⟷ WebSocket ⟷ [自宅PC] → [localhost:<PORT>]
 ```
 
-1台のサーバー(VPS)で複数のクライアントを同時にホストできる。各クライアントはそれぞれ異なる公開ポートを使用する。
+1台のサーバー(VPS)で複数のクライアントを同時にホストできる。各クライアントにはサーバーがランダムなポートを自動割り当てする。
 
 ```
-クライアントA (自宅PC-A) ⟷ WebSocket ⟷ [VPS :49152] ← 外部ユーザー
-クライアントB (自宅PC-B) ⟷ WebSocket ⟷ [VPS :49153] ← 外部ユーザー
-クライアントC (自宅PC-C) ⟷ WebSocket ⟷ [VPS :49154] ← 外部ユーザー
+クライアントA (自宅PC-A) ⟷ WebSocket ⟷ [VPS :59382] ← 外部ユーザー
+クライアントB (自宅PC-B) ⟷ WebSocket ⟷ [VPS :51847] ← 外部ユーザー
+クライアントC (自宅PC-C) ⟷ WebSocket ⟷ [VPS :63291] ← 外部ユーザー
 ```
 
-1. クライアント(自宅)がサーバー(VPS)にWebSocketで接続し、公開ポートを登録
-2. 外部クライアントがサーバーの該当ポートに接続
-3. サーバーがWebSocket経由でクライアントにトラフィックを転送
-4. クライアントがローカルサービスにトラフィックを転送
+1. クライアント(自宅)がサーバー(VPS)にWebSocketで接続
+2. サーバーがランダムなポートを割り当て、クライアントに通知
+3. 外部クライアントがサーバーの該当ポートに接続
+4. サーバーがWebSocket経由でクライアントにトラフィックを転送
+5. クライアントがローカルサービスにトラフィックを転送
 
 ## ビルド
 
 ```bash
-# サーバー側
-go build -o tunnel-server ./cmd/server
+# サーバー側（Linux向け）
+GOOS=linux GOARCH=amd64 go build -o tunnel-server ./cmd/server
 
-# クライアント
-go build -o tunnel-client ./cmd/client
+# クライアント（Windows向け）
+go build -o tunnel-client.exe ./cmd/client
 ```
 
 ## 使い方
@@ -42,20 +43,23 @@ go build -o tunnel-client ./cmd/client
 | フラグ | デフォルト | 説明 |
 |--------|-----------|------|
 | `-control` | `:8080` | クライアントが接続するHTTP/WSアドレス |
+| `-port-min` | `49152` | ランダムポート割り当て範囲の下限 |
+| `-port-max` | `65535` | ランダムポート割り当て範囲の上限 |
 
-サーバーは1プロセスで複数クライアントに対応する。公開ポートはクライアント接続時に動的に割り当てられる。
+サーバーは1プロセスで複数クライアントに対応する。公開ポートはクライアント接続時にランダムに割り当てられる。
 
 ### クライアント側（自宅）
 
 ```bash
-./tunnel-client -server ws://your-vps:8080 -public <PORT> -local localhost:<PORT>
+tunnel-client.exe -server wss://<YOUR-DOMAIN> -local localhost:25565
 ```
 
 | フラグ | デフォルト | 説明 |
 |--------|-----------|------|
 | `-server` | (必須) | サーバーのWebSocket URL |
-| `-public` | (必須) | サーバー側で公開するポート番号 |
-| `-local` | `localhost:49152` | 転送先のローカルアドレス |
+| `-local` | `localhost:25565` | 転送先のローカルアドレス |
+
+接続するとサーバーから割り当てられたポート番号がログに表示される。このポート番号を外部ユーザーに共有する。
 
 ### 例：複数サービスを1台のVPSで公開
 
@@ -64,23 +68,42 @@ go build -o tunnel-client ./cmd/client
    ./tunnel-server -control :8080
    ```
 
-2. ユーザーAがMinecraftサーバーを公開（ポート49152）：
+2. ユーザーAがMinecraftサーバーを公開：
    ```bash
-   ./tunnel-client -server ws://vps-ip:8080 -public 49152 -local localhost:49152
+   tunnel-client.exe -server wss://tunnel.example.com -local localhost:25565
+   # ログ出力: [client] assigned public port: 59382
    ```
 
-3. ユーザーBがWebサーバーを公開（ポート49153）：
+3. ユーザーBがWebサーバーを公開：
    ```bash
-   ./tunnel-client -server ws://vps-ip:8080 -public 49153 -local localhost:49153
+   tunnel-client.exe -server wss://tunnel.example.com -local localhost:8000
+   # ログ出力: [client] assigned public port: 51847
    ```
 
-4. 外部クライアントはそれぞれ `vps-ip:49152`、`vps-ip:49153` で接続
+4. 外部クライアントはそれぞれ `tunnel.example.com:59382`、`tunnel.example.com:51847` で接続
+
+## セキュリティ
+
+- Caddy + TLSによるWebSocket通信の暗号化（wss://）
+- ランダムポート割り当てによるポート推測の困難化
+- レート制限によるポートスキャン対策
+
+VPSでのレート制限設定：
+```bash
+sudo iptables -A INPUT -p tcp --dport 49152:65535 -m state --state NEW -m recent --set
+sudo iptables -A INPUT -p tcp --dport 49152:65535 -m state --state NEW -m recent --update --seconds 10 --hitcount 3 -j DROP
+```
+
+## セットアップ
+
+- [VPSセットアップ手順（セキュア版 / Caddy + TLS）](docs/vps-setup-secure.md)
+- [VPSセットアップ手順（IP直接接続版）](docs/vps-setup-ip.md)
 
 ## 特徴
 
 - WebSocket経由のTCPトンネリング
 - 1台のVPSサーバーで複数クライアントをホスト
-- クライアント接続時に公開ポートを動的割り当て
+- ランダムポート自動割り当て
 - 自動再接続（指数バックオフ）
 - Ping/Pongによるキープアライブ
 - 接続タイムアウト管理

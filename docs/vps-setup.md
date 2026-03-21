@@ -1,10 +1,7 @@
-# VPSサーバーセットアップ手順（セキュア版 / Caddy + TLS）
+# VPSサーバーセットアップ手順
 
 Ubuntu 24.04 LTS を前提とした、tunnel-server の環境構築手順。
-Caddy をリバースプロキシとして使用し、WebSocket 通信を TLS（wss://）で暗号化する。
-ドメインが必要。rootでSSHログインした状態から開始する。
-
-> IP直接接続の簡易構成は [vps-setup-ip.md](vps-setup-ip.md) を参照すること。
+rootでSSHログインした状態から開始する。
 
 ## 1. システム更新
 
@@ -15,14 +12,14 @@ apt update && apt upgrade -y
 ## 2. 専用ユーザー作成
 
 ```bash
-adduser tunnel-server-manager
-usermod -aG sudo tunnel-server-manager
+adduser tunnel-server-manageer
+usermod -aG sudo tunnel-server-manageer
 ```
 
-## 3. SSH鍵認証の設定（tunnel-server-managerユーザー）
+## 3. SSH鍵認証の設定（tunnel-server-manageerユーザー）
 
 ```bash
-su - tunnel-server-manager
+su - tunnel-server-manageer
 mkdir -p ~/.ssh && chmod 700 ~/.ssh
 vi ~/.ssh/authorized_keys   # 自宅PCの公開鍵を貼り付ける
 chmod 600 ~/.ssh/authorized_keys
@@ -37,7 +34,7 @@ sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd
 systemctl restart ssh
 ```
 
-以降は `tunnel-server-manager` ユーザーでSSHログインして作業する。
+以降は `tunnel-server-manageer` ユーザーでSSHログインして作業する。
 
 ## 5. SSH config設定（自宅PC側）
 
@@ -46,7 +43,7 @@ systemctl restart ssh
 ```
 Host tunnel-server
     HostName <VPS-IP>
-    User tunnel-server-manager
+    User tunnel-server-manageer
     IdentityFile ~/.ssh/id_ed25519
 ```
 
@@ -72,22 +69,13 @@ chmod +x ~/tunnel-server/tunnel-server
 
 ## 7. ファイアウォール設定
 
-公開ポートはtunnel-serverがiptablesで動的に管理するため、ufwでの範囲許可は不要。
-
 ```bash
 sudo ufw allow 22/tcp           # SSH
 sudo ufw allow 80/tcp           # Caddy（証明書取得用）
 sudo ufw allow 443/tcp          # Caddy（HTTPS/WSS）
+sudo ufw allow 49152:49200/tcp  # クライアントが使う公開ポート範囲
 sudo ufw enable
 ```
-
-tunnel-serverにiptables操作権限を付与する：
-
-```bash
-sudo setcap cap_net_admin+ep /home/tunnel-server-manager/tunnel-server/tunnel-server
-```
-
-> **注意**: バイナリを更新するたびにsetcapの再実行が必要。
 
 ## 8. Caddyのインストールと設定
 
@@ -133,9 +121,9 @@ After=network.target
 
 [Service]
 Type=simple
-User=tunnel-server-manager
-WorkingDirectory=/home/tunnel-server-manager/tunnel-server
-ExecStart=/home/tunnel-server-manager/tunnel-server/tunnel-server -control :8080 -port-min 49152 -port-max 65535
+User=tunnel-server-manageer
+WorkingDirectory=/home/tunnel-server-manageer/tunnel-server
+ExecStart=/home/tunnel-server-manageer/tunnel-server/tunnel-server -control :8080
 Restart=always
 RestartSec=5
 
@@ -146,8 +134,6 @@ EOF
 sudo systemctl daemon-reload
 sudo systemctl enable tunnel-server
 sudo systemctl start tunnel-server
-sudo systemctl status tunnel-server
-
 ```
 
 ## 10. 動作確認
@@ -165,8 +151,7 @@ sudo journalctl -u tunnel-server -f
 自宅PC側で以下を実行：
 
 ```bash
-tunnel-client.exe -server wss://<YOUR-DOMAIN> -local localhost:25565
+tunnel-client.exe -server wss://<YOUR-DOMAIN> -public 49152 -local localhost:49152
 ```
 
-VPS側のログに `tunnel client connected` と `assigned port` が表示されれば成功。
-クライアント側のログに表示されるポート番号を外部ユーザーに共有する。
+VPS側のログに `tunnel client connected` と表示されれば成功。

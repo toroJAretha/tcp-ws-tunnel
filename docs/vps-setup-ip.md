@@ -16,14 +16,14 @@ apt update && apt upgrade -y
 ## 2. 専用ユーザー作成
 
 ```bash
-adduser tunnel-sever-manageer
-usermod -aG sudo tunnel-sever-manageer
+adduser tunnel-server-manageer
+usermod -aG sudo tunnel-server-manageer
 ```
 
-## 3. SSH鍵認証の設定（tunnel-sever-manageerユーザー）
+## 3. SSH鍵認証の設定（tunnel-server-manageerユーザー）
 
 ```bash
-su - tunnel-sever-manageer
+su - tunnel-server-manageer
 mkdir -p ~/.ssh && chmod 700 ~/.ssh
 vi ~/.ssh/authorized_keys   # 自宅PCの公開鍵を貼り付ける
 chmod 600 ~/.ssh/authorized_keys
@@ -38,7 +38,7 @@ sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd
 systemctl restart ssh
 ```
 
-以降は `tunnel-sever-manageer` ユーザーでSSHログインして作業する。
+以降は `tunnel-server-manageer` ユーザーでSSHログインして作業する。
 
 ## 5. SSH config設定（自宅PC側）
 
@@ -47,7 +47,7 @@ systemctl restart ssh
 ```
 Host tunnel-server
     HostName <VPS-IP>
-    User tunnel-sever-manageer
+    User tunnel-server-manageer
     IdentityFile ~/.ssh/id_ed25519
 ```
 
@@ -56,29 +56,38 @@ Host tunnel-server
 ## 6. バイナリ配置
 
 ```bash
-mkdir -p ~/tunnel-sever
+mkdir -p ~/tunnel-server
 ```
 
 自宅PC側からバイナリをアップロードする：
 
 ```bash
-scp tunnel-server tunnel-server:~/tunnel-sever/
+scp tunnel-server tunnel-server:~/tunnel-server/
 ```
 
 VPS側で実行権限を付与：
 
 ```bash
-chmod +x ~/tunnel-sever/tunnel-server
+chmod +x ~/tunnel-server/tunnel-server
 ```
 
 ## 7. ファイアウォール設定
 
+公開ポートはtunnel-serverがiptablesで動的に管理するため、ufwでの範囲許可は不要。
+
 ```bash
 sudo ufw allow 22/tcp           # SSH
 sudo ufw allow 8080/tcp         # 制御チャネル（WebSocket）
-sudo ufw allow 49152:49200/tcp  # クライアントが使う公開ポート範囲
 sudo ufw enable
 ```
+
+tunnel-serverにiptables操作権限を付与する：
+
+```bash
+sudo setcap cap_net_admin+ep /home/tunnel-server-manageer/tunnel-server/tunnel-server
+```
+
+> **注意**: バイナリを更新するたびにsetcapの再実行が必要。
 
 ## 8. systemdサービス化
 
@@ -92,9 +101,9 @@ After=network.target
 
 [Service]
 Type=simple
-User=tunnel-sever-manageer
-WorkingDirectory=/home/tunnel-sever-manageer/tunnel-sever
-ExecStart=/home/tunnel-sever-manageer/tunnel-sever/tunnel-server -control :8080
+User=tunnel-server-manageer
+WorkingDirectory=/home/tunnel-server-manageer/tunnel-server
+ExecStart=/home/tunnel-server-manageer/tunnel-server/tunnel-server -control :8080 -port-min 49152 -port-max 65535
 Restart=always
 RestartSec=5
 
@@ -122,7 +131,8 @@ sudo journalctl -u tunnel-server -f
 自宅PC側で以下を実行：
 
 ```bash
-tunnel-client.exe -server ws://<VPS-IP>:8080 -public 49152 -local localhost:49152
+tunnel-client.exe -server ws://<VPS-IP>:8080 -local localhost:25565
 ```
 
-VPS側のログに `tunnel client connected` と表示されれば成功。
+VPS側のログに `tunnel client connected` と `assigned port` が表示されれば成功。
+クライアント側のログに表示されるポート番号を外部ユーザーに共有する。
