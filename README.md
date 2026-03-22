@@ -59,16 +59,36 @@ go build -o builds/tunnel-client.exe ./cmd/client
 
 サーバーは1プロセスで複数クライアントに対応する。公開ポートはクライアント接続時にランダムに割り当てられる。
 
+### 認証API（VPS）
+
+```bash
+./tunnel-auth -addr :8081 -secret <HMAC秘密鍵> -users users.json -expiry 24h
+```
+
+| フラグ | デフォルト | 説明 |
+|--------|-----------|------|
+| `-addr` | `:8081` | 認証APIのリッスンアドレス |
+| `-secret` | (必須) | JWT署名用のHMAC秘密鍵（tunnel-serverと同じ値） |
+| `-users` | `users.json` | ユーザー情報JSONファイルのパス |
+| `-expiry` | `24h` | JWTの有効期限（例: 1h, 24h, 7d） |
+
+ユーザー追加：
+```bash
+./tunnel-auth add-user -user <ユーザーID> -password <パスワード>
+```
+
 ### クライアント側（自宅）
 
 ```bash
-tunnel-client.exe -server wss://<YOUR-DOMAIN> -local localhost:25565
+tunnel-client.exe -server wss://<YOUR-DOMAIN> -local localhost:25565 -user <ユーザーID> -password <パスワード>
 ```
 
 | フラグ | デフォルト | 説明 |
 |--------|-----------|------|
 | `-server` | (必須) | サーバーのWebSocket URL |
 | `-local` | `localhost:25565` | 転送先のローカルアドレス |
+| `-user` | (必須) | 認証ユーザーID |
+| `-password` | (必須) | 認証パスワード |
 
 接続するとサーバーから割り当てられたポート番号がログに表示される。このポート番号を外部ユーザーに共有する。
 
@@ -76,18 +96,18 @@ tunnel-client.exe -server wss://<YOUR-DOMAIN> -local localhost:25565
 
 1. VPSでサーバーを起動：
    ```bash
-   ./tunnel-server -control :8080
+   ./tunnel-server -control :8080 -secret <HMAC秘密鍵>
    ```
 
 2. ユーザーAがMinecraftサーバーを公開：
    ```bash
-   tunnel-client.exe -server wss://tunnel.example.com -local localhost:25565
+   tunnel-client.exe -server wss://tunnel.example.com -local localhost:25565 -user userA -password passA
    # ログ出力: [client] assigned public port: 59382
    ```
 
 3. ユーザーBがWebサーバーを公開：
    ```bash
-   tunnel-client.exe -server wss://tunnel.example.com -local localhost:8000
+   tunnel-client.exe -server wss://tunnel.example.com -local localhost:8000 -user userB -password passB
    # ログ出力: [client] assigned public port: 51847
    ```
 
@@ -102,7 +122,7 @@ tunnel-client.exe -server wss://<YOUR-DOMAIN> -local localhost:25565
 - bcryptによるパスワードハッシュ化（サーバー側）
 - DPAPIによるパスワード暗号化（クライアントGUI側）
 - ランダムポート割り当てによるポート推測の困難化
-- レート制限によるポートスキャン対策
+- iptablesによる動的ポートフィルタリング（未使用ポートへのアクセス遮断）
 - エラーコードのみ返却（内部情報の非公開）
 
 ## エラーコード
@@ -126,8 +146,12 @@ tunnel-client.exe -server wss://<YOUR-DOMAIN> -local localhost:25565
 
 - WebSocket経由のTCPトンネリング
 - 1台のVPSサーバーで複数クライアントをホスト
+- JWT認証・複数ユーザー対応
+- 1ユーザーあたりのトンネル数制限
+- iptablesによる動的ポートフィルタリング
 - ランダムポート自動割り当て
 - 自動再接続（指数バックオフ）
 - Ping/Pongによるキープアライブ
 - 接続タイムアウト管理
 - シグナルによるグレースフルシャットダウン
+- GUIクライアント（tkinter / tunnel-client同梱）

@@ -63,12 +63,14 @@ mkdir -p ~/tunnel-server
 
 ```bash
 scp builds/tunnel-server tunnel-server:~/tunnel-server/
+scp builds/tunnel-auth tunnel-server:~/tunnel-server/
 ```
 
 VPS側で実行権限を付与：
 
 ```bash
 chmod +x ~/tunnel-server/tunnel-server
+chmod +x ~/tunnel-server/tunnel-auth
 ```
 
 ## 7. ファイアウォール設定
@@ -78,6 +80,7 @@ chmod +x ~/tunnel-server/tunnel-server
 ```bash
 sudo ufw allow 22/tcp           # SSH
 sudo ufw allow 8080/tcp         # 制御チャネル（WebSocket）
+sudo ufw allow 8081/tcp         # 認証API
 sudo ufw enable
 ```
 
@@ -88,6 +91,31 @@ sudo setcap cap_net_admin+ep /home/tunnel-server-manager/tunnel-server/tunnel-se
 ```
 
 > **注意**: バイナリを更新するたびにsetcapの再実行が必要。
+
+## 7.5. 認証設定
+
+JWT秘密鍵を生成する：
+
+```bash
+openssl rand -hex 32
+```
+
+環境変数ファイルに保存する：
+
+```bash
+cat > ~/tunnel-server/.tunnel-env << 'EOF'
+AUTH_SECRET=<上で生成した秘密鍵>
+EOF
+chmod 600 ~/tunnel-server/.tunnel-env
+```
+
+ユーザーを登録する：
+
+```bash
+cd ~/tunnel-server
+./tunnel-auth add-user -user <ユーザーID> -password <パスワード>
+chmod 600 ~/tunnel-server/users.json
+```
 
 ## 8. systemdサービス化
 
@@ -103,7 +131,8 @@ After=network.target
 Type=simple
 User=tunnel-server-manager
 WorkingDirectory=/home/tunnel-server-manager/tunnel-server
-ExecStart=/home/tunnel-server-manager/tunnel-server/tunnel-server -control :8080 -port-min 49152 -port-max 65535
+EnvironmentFile=/home/tunnel-server-manager/tunnel-server/.tunnel-env
+ExecStart=/home/tunnel-server-manager/tunnel-server/tunnel-server -control :8080 -port-min 49152 -port-max 65535 -secret ${AUTH_SECRET} -max-per-user 1
 Restart=always
 RestartSec=5
 
@@ -114,6 +143,32 @@ EOF
 sudo systemctl daemon-reload
 sudo systemctl enable tunnel-server
 sudo systemctl start tunnel-server
+```
+
+### 認証APIサービス
+
+```bash
+sudo tee /etc/systemd/system/tunnel-auth.service > /dev/null << 'EOF'
+[Unit]
+Description=Tunnel Auth API
+After=network.target
+
+[Service]
+Type=simple
+User=tunnel-server-manager
+WorkingDirectory=/home/tunnel-server-manager/tunnel-server
+EnvironmentFile=/home/tunnel-server-manager/tunnel-server/.tunnel-env
+ExecStart=/home/tunnel-server-manager/tunnel-server/tunnel-auth -addr :8081 -secret ${AUTH_SECRET} -users /home/tunnel-server-manager/tunnel-server/users.json -expiry 24h
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable tunnel-auth
+sudo systemctl start tunnel-auth
 ```
 
 ## 9. 動作確認
@@ -131,7 +186,7 @@ sudo journalctl -u tunnel-server -f
 自宅PC側で以下を実行：
 
 ```bash
-tunnel-client.exe -server ws://<VPS-IP>:8080 -local localhost:25565
+tunnel-client.exe -server ws://<VPS-IP>:8080 -local localhost:25565 -user <認証ユーザーID> -password <認証パスワード>
 ```
 
 VPS側のログに `tunnel client connected` と `assigned port` が表示されれば成功。
