@@ -4,19 +4,40 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
-	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 	"github.com/toroJ/port-tunnel/pkg/protocol"
 )
 
-// WebSocketアップグレーダー（全オリジン許可）
+// エラーコード定義
+// E1xxx: 認証エラー
+// E2xxx: リソース制限エラー
+// E3xxx: リクエストエラー
+// E5xxx: サーバー内部エラー
+const (
+	ErrCodeTokenMissing  = "E1001" // トークンが未指定
+	ErrCodeTokenInvalid  = "E1002" // トークンが無効または期限切れ
+	ErrCodeForbidden     = "E1003" // アクセス権限なし
+	ErrCodeTunnelLimit   = "E2001" // トンネル数の上限超過
+	ErrCodeBadRequest    = "E3001" // リクエストパラメータ不正
+	ErrCodeNotFound      = "E3002" // リソースが見つからない
+	ErrCodePortExhausted = "E5001" // ポート割り当て失敗
+)
+
+// WebSocketアップグレーダー
+// Originヘッダーなし（CLIクライアント）は許可、あり（ブラウザ経由）は拒否
+// 注意: CSRF防御は主にJWT認証に依存する。Originチェックは補助的な防御層。
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin: func(r *http.Request) bool {
+		return r.Header.Get("Origin") == ""
+	},
 }
 
 // pendingConn はデータチャネルの確立を待っているTCP接続を保持する。
@@ -29,6 +50,8 @@ type pendingConn struct {
 // tunnel は1つのクライアントのトンネルセッションを表す。
 type tunnel struct {
 	id         string           // トンネルの一意なID
+	ownerID    string           // トンネル所有者のユーザーID
+	clientIP   string           // クライアントの接続元IPアドレス
 	publicPort int              // 外部に公開するポート番号
 	controlWS  *websocket.Conn  // クライアントとの制御チャネル
 	controlMu  sync.Mutex       // 制御チャネルへの書き込みを直列化するミューテックス
@@ -38,61 +61,132 @@ type tunnel struct {
 // Server は外部公開用のトンネルサーバー。
 // 複数のクライアントが同時に異なるポートでトンネルを作成できる。
 type Server struct {
-	ControlAddr string // HTTP/WSリッスンアドレス（例: ":8080"）
+	ControlAddr    string // HTTP/WSリッスンアドレス（例: ":8080"）
+	PortMin        int    // ランダムポート割り当て範囲の下限
+	PortMax        int    // ランダムポート割り当て範囲の上限
+	JWTSecret      string // JWT署名検証用のHMAC秘密鍵（空の場合は認証なし）
+	MaxPerUser     int    // 1ユーザーあたりの最大トンネル数（0の場合は制限なし）
 
-	mu      sync.Mutex
-	tunnels map[int]*tunnel         // 公開ポート番号をキーとしたトンネルマップ
-	pending map[string]*pendingConn // 接続IDをキーとした待機中のTCP接続マップ
+	mu        sync.Mutex
+	tunnels   map[int]*tunnel         // 公開ポート番号をキーとしたトンネルマップ
+	tunnelsByID map[string]*tunnel    // トンネルIDをキーとした逆引きマップ
+	pending   map[string]*pendingConn // 接続IDをキーとした待機中のTCP接続マップ
 }
 
 // Run はサーバーを起動する。コンテキストがキャンセルされるまでブロックする。
 func (s *Server) Run(ctx context.Context) error {
 	s.tunnels = make(map[int]*tunnel)
+	s.tunnelsByID = make(map[string]*tunnel)
 	s.pending = make(map[string]*pendingConn)
 
 	// HTTPルーティングの設定
 	mux := http.NewServeMux()
 	mux.HandleFunc("/control", func(w http.ResponseWriter, r *http.Request) {
-		s.handleControl(ctx, w, r)
+		userID, ok := s.authenticate(w, r)
+		if !ok {
+			return
+		}
+		s.handleControl(ctx, w, r, userID)
 	})
-	mux.HandleFunc("/data", s.handleData)
+	mux.HandleFunc("/data", func(w http.ResponseWriter, r *http.Request) {
+		userID, ok := s.authenticate(w, r)
+		if !ok {
+			return
+		}
+		s.handleData(w, r, userID)
+	})
 
 	httpServer := &http.Server{
-		Addr:    s.ControlAddr,
-		Handler: mux,
+		Addr:              s.ControlAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	// タイムアウトした待機中接続の定期クリーンアップ
 	go s.cleanupPending(ctx)
 
-	// コンテキストキャンセル時にHTTPサーバーをシャットダウン
+	// コンテキストキャンセル時にHTTPサーバーをシャットダウン（10秒タイムアウト）
 	go func() {
 		<-ctx.Done()
-		httpServer.Shutdown(context.Background())
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("[server] http shutdown error: %v", err)
+		}
 	}()
 
-	log.Printf("[server] control channel: %s (multi-tenant mode)", s.ControlAddr)
+	// ファイアウォールのカスタムチェーンを初期化
+	if err := initFirewall(s.PortMin, s.PortMax); err != nil {
+		log.Printf("[server] firewall initialization failed (continuing without firewall): %v", err)
+	} else {
+		// サーバー終了時にファイアウォールをクリーンアップ
+		defer cleanupFirewall(s.PortMin, s.PortMax)
+	}
+
+	if s.JWTSecret == "" {
+		log.Printf("[server] WARNING: -secret is not set. Authentication, per-user tunnel limits, and session binding are disabled.")
+	}
+	log.Printf("[server] control channel: %s, port range: %d-%d", s.ControlAddr, s.PortMin, s.PortMax)
 	if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
 		return fmt.Errorf("http server: %w", err)
 	}
 	return nil
 }
 
-// handleControl はクライアントからの制御チャネル接続を処理する。
-// クエリパラメータ ?port= で指定されたポートのTCPリスナーを動的に作成する。
-func (s *Server) handleControl(ctx context.Context, w http.ResponseWriter, r *http.Request) {
-	// ポート番号のバリデーション
-	portStr := r.URL.Query().Get("port")
-	if portStr == "" {
-		http.Error(w, "missing port parameter (e.g., /control?port=49152)", http.StatusBadRequest)
-		return
+// candidatePorts はs.muを保持した状態で、未使用のポート候補リストを返す。
+// 呼び出し元がs.muを保持していること。
+func (s *Server) candidatePorts() []int {
+	portRange := s.PortMax - s.PortMin + 1
+	start := rand.Intn(portRange)
+	candidates := make([]int, 0, portRange)
+	for i := 0; i < portRange; i++ {
+		port := s.PortMin + (start+i)%portRange
+		if _, exists := s.tunnels[port]; !exists {
+			candidates = append(candidates, port)
+		}
 	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil || port < 1 || port > 65535 {
-		http.Error(w, "invalid port number", http.StatusBadRequest)
-		return
+	return candidates
+}
+
+// authenticate はリクエストのAuthorizationヘッダーのJWTを検証し、ユーザーIDを返す。
+// JWTSecret未設定の場合は常に許可する。接続時のみ検証し、接続中は再検証しない。
+func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (string, bool) {
+	if s.JWTSecret == "" {
+		return "", true
+	}
+	auth := r.Header.Get("Authorization")
+	tokenStr := strings.TrimPrefix(auth, "Bearer ")
+	if tokenStr == "" || tokenStr == auth {
+		log.Printf("[server] %s: missing token from %s", ErrCodeTokenMissing, r.RemoteAddr)
+		http.Error(w, ErrCodeTokenMissing, http.StatusUnauthorized)
+		return "", false
 	}
 
+	token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
+		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+		}
+		return []byte(s.JWTSecret), nil
+	})
+	if err != nil || !token.Valid {
+		log.Printf("[server] %s: invalid token from %s: %v", ErrCodeTokenInvalid, r.RemoteAddr, err)
+		http.Error(w, ErrCodeTokenInvalid, http.StatusUnauthorized)
+		return "", false
+	}
+
+	// JWTのsubjectからユーザーIDを取得
+	subject, _ := token.Claims.GetSubject()
+	if subject == "" {
+		log.Printf("[server] %s: empty subject in token from %s", ErrCodeTokenInvalid, r.RemoteAddr)
+		http.Error(w, ErrCodeTokenInvalid, http.StatusUnauthorized)
+		return "", false
+	}
+	return subject, true
+}
+
+// handleControl はクライアントからの制御チャネル接続を処理する。
+// ランダムなポートを割り当て、クライアントに通知する。
+func (s *Server) handleControl(ctx context.Context, w http.ResponseWriter, r *http.Request, userID string) {
 	// HTTPからWebSocketへアップグレード
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -100,56 +194,114 @@ func (s *Server) handleControl(ctx context.Context, w http.ResponseWriter, r *ht
 		return
 	}
 
-	// 指定ポートが既に他のトンネルで使用されていないか確認
+	// 1ユーザーあたりのトンネル数制限チェックとポート候補取得（ロック内）
 	s.mu.Lock()
-	if _, exists := s.tunnels[port]; exists {
-		s.mu.Unlock()
-		ws.WriteMessage(websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.ClosePolicyViolation,
-				fmt.Sprintf("port %d is already in use by another client", port)))
-		ws.Close()
-		return
+	if s.MaxPerUser > 0 && userID != "" {
+		count := 0
+		for _, t := range s.tunnels {
+			if t.ownerID == userID {
+				count++
+			}
+		}
+		if count >= s.MaxPerUser {
+			s.mu.Unlock()
+			log.Printf("[server] user %s exceeded max tunnels (%d)", userID, s.MaxPerUser)
+			ws.WriteMessage(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.ClosePolicyViolation, ErrCodeTunnelLimit))
+			ws.Close()
+			return
+		}
 	}
+	candidates := s.candidatePorts()
 	s.mu.Unlock()
 
-	// 指定ポートでTCPリスナーを起動
-	listenAddr := fmt.Sprintf(":%d", port)
-	listener, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		log.Printf("[server] failed to listen on %s: %v", listenAddr, err)
+	// ポート候補に対してnet.Listenを試行（ロック外）
+	var port int
+	var listener net.Listener
+	for _, p := range candidates {
+		l, err := net.Listen("tcp", fmt.Sprintf(":%d", p))
+		if err != nil {
+			continue
+		}
+		port = p
+		listener = l
+		break
+	}
+	if listener == nil {
+		log.Printf("[server] port allocation failed: no available port in range %d-%d", s.PortMin, s.PortMax)
 		ws.WriteMessage(websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseInternalServerErr,
-				fmt.Sprintf("cannot listen on port %d: %v", port, err)))
+			websocket.FormatCloseMessage(websocket.CloseInternalServerErr, ErrCodePortExhausted))
 		ws.Close()
 		return
 	}
 
-	tunnelID, _ := protocol.GenerateConnectionID()
+	tunnelID, err := protocol.GenerateConnectionID()
+	if err != nil {
+		listener.Close()
+		log.Printf("[server] %s: failed to generate tunnel id: %v", ErrCodePortExhausted, err)
+		ws.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseInternalServerErr, ErrCodePortExhausted))
+		ws.Close()
+		return
+	}
 	tunnelCtx, tunnelCancel := context.WithCancel(ctx)
+
+	// クライアントIPを取得
+	clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
 
 	t := &tunnel{
 		id:         tunnelID,
+		ownerID:    userID,
+		clientIP:   clientIP,
 		publicPort: port,
 		controlWS:  ws,
 		listener:   listener,
 	}
 
-	// トンネルをマップに登録（リスナー作成後に再度重複チェック）
+	// ポートをマップに登録（ロック内）
 	s.mu.Lock()
+	// 競合チェック：別のgoroutineが同じポートを先に取った場合
 	if _, exists := s.tunnels[port]; exists {
 		s.mu.Unlock()
-		tunnelCancel()
 		listener.Close()
+		tunnelCancel()
+		log.Printf("[server] port %d was taken by another tunnel", port)
 		ws.WriteMessage(websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.ClosePolicyViolation,
-				fmt.Sprintf("port %d is already in use by another client", port)))
+			websocket.FormatCloseMessage(websocket.CloseInternalServerErr, ErrCodePortExhausted))
 		ws.Close()
 		return
 	}
 	s.tunnels[port] = t
+	s.tunnelsByID[tunnelID] = t
 	s.mu.Unlock()
 
-	log.Printf("[server] tunnel client connected from %s, public port :%d", r.RemoteAddr, port)
+	// ファイアウォールでポートを開放
+	if err := openPort(port); err != nil {
+		log.Printf("[server] firewall open failed (port %d): %v", port, err)
+	}
+
+	// 割り当てたポートをクライアントに通知
+	t.controlMu.Lock()
+	err = ws.WriteJSON(protocol.ControlMessage{
+		Type: protocol.TypePortAssigned,
+		Port: port,
+	})
+	t.controlMu.Unlock()
+	if err != nil {
+		tunnelCancel()
+		listener.Close()
+		if closeErr := closePort(port); closeErr != nil {
+			log.Printf("[server] firewall close failed (port %d): %v", port, closeErr)
+		}
+		s.mu.Lock()
+		delete(s.tunnels, port)
+		delete(s.tunnelsByID, tunnelID)
+		s.mu.Unlock()
+		ws.Close()
+		return
+	}
+
+	log.Printf("[server] tunnel client connected from %s, assigned port :%d", r.RemoteAddr, port)
 
 	// このトンネルのTCP接続受付を開始
 	go s.acceptTCP(tunnelCtx, listener, t)
@@ -159,9 +311,15 @@ func (s *Server) handleControl(ctx context.Context, w http.ResponseWriter, r *ht
 		tunnelCancel()
 		listener.Close()
 
+		// ファイアウォールでポートを閉鎖
+		if err := closePort(port); err != nil {
+			log.Printf("[server] firewall close failed (port %d): %v", port, err)
+		}
+
 		s.mu.Lock()
 		// トンネルをマップから削除
 		delete(s.tunnels, port)
+		delete(s.tunnelsByID, tunnelID)
 		// このトンネルに属する待機中の接続をすべて閉じる
 		for id, p := range s.pending {
 			if p.tunnelID == tunnelID {
@@ -228,10 +386,10 @@ func (s *Server) handleControl(ctx context.Context, w http.ResponseWriter, r *ht
 
 // handleData はクライアントからのデータチャネル接続を処理する。
 // 待機中のTCP接続とWebSocketを紐付けて双方向転送を開始する。
-func (s *Server) handleData(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleData(w http.ResponseWriter, r *http.Request, userID string) {
 	connID := r.URL.Query().Get("id")
 	if connID == "" {
-		http.Error(w, "missing id parameter", http.StatusBadRequest)
+		http.Error(w, ErrCodeBadRequest, http.StatusBadRequest)
 		return
 	}
 
@@ -240,9 +398,33 @@ func (s *Server) handleData(w http.ResponseWriter, r *http.Request) {
 	p, ok := s.pending[connID]
 	if !ok {
 		s.mu.Unlock()
-		http.Error(w, "unknown connection id", http.StatusNotFound)
+		http.Error(w, ErrCodeNotFound, http.StatusNotFound)
 		return
 	}
+
+	// 接続IDの所有者を検証
+	ownerMatch := true
+	if t, ok := s.tunnelsByID[p.tunnelID]; ok {
+		if userID != "" {
+			// JWT認証モード: ユーザーIDで照合
+			if t.ownerID != userID {
+				ownerMatch = false
+			}
+		} else {
+			// 認証なしモード: クライアントIPで照合
+			reqIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+			if t.clientIP != reqIP {
+				ownerMatch = false
+			}
+		}
+	}
+	if !ownerMatch {
+		s.mu.Unlock()
+		log.Printf("[server] user %s attempted to access connection %s owned by another user", userID, protocol.ShortID(connID))
+		http.Error(w, ErrCodeForbidden, http.StatusForbidden)
+		return
+	}
+
 	delete(s.pending, connID)
 	s.mu.Unlock()
 
@@ -254,9 +436,9 @@ func (s *Server) handleData(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[server] data channel established for connection %s", connID[:8])
+	log.Printf("[server] data channel established for connection %s", protocol.ShortID(connID))
 	// TCP接続とWebSocket間で双方向データ転送を開始
-	bridge(p.conn, ws)
+	protocol.Bridge(p.conn, ws)
 }
 
 // acceptTCP は指定リスナーでTCP接続を受け付け、それぞれgoroutineで処理する。
@@ -293,7 +475,7 @@ func (s *Server) handleTCPConn(conn net.Conn, t *tunnel) {
 	s.pending[connID] = &pendingConn{conn: conn, tunnelID: t.id, created: time.Now()}
 	s.mu.Unlock()
 
-	log.Printf("[server] new connection %s from %s (port %d)", connID[:8], conn.RemoteAddr(), t.publicPort)
+	log.Printf("[server] new connection %s from %s (port %d)", protocol.ShortID(connID), conn.RemoteAddr(), t.publicPort)
 
 	// 制御チャネル経由でクライアントに新規接続を通知
 	msg := protocol.ControlMessage{
@@ -328,7 +510,7 @@ func (s *Server) cleanupPending(ctx context.Context) {
 			now := time.Now()
 			for id, p := range s.pending {
 				if now.Sub(p.created) > 10*time.Second {
-					log.Printf("[server] pending connection %s timed out", id[:8])
+					log.Printf("[server] pending connection %s timed out", protocol.ShortID(id))
 					p.conn.Close()
 					delete(s.pending, id)
 				}
@@ -338,43 +520,3 @@ func (s *Server) cleanupPending(ctx context.Context) {
 	}
 }
 
-// bridge はTCP接続とWebSocket間でデータを双方向にコピーする。
-// いずれか一方が終了すると、両方の接続を閉じる。
-func bridge(tcp net.Conn, ws *websocket.Conn) {
-	done := make(chan struct{}, 2)
-
-	// TCP → WebSocket
-	go func() {
-		defer func() { done <- struct{}{} }()
-		buf := make([]byte, 32*1024)
-		for {
-			n, err := tcp.Read(buf)
-			if err != nil {
-				return
-			}
-			if err := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
-				return
-			}
-		}
-	}()
-
-	// WebSocket → TCP
-	go func() {
-		defer func() { done <- struct{}{} }()
-		for {
-			_, data, err := ws.ReadMessage()
-			if err != nil {
-				return
-			}
-			if _, err := tcp.Write(data); err != nil {
-				return
-			}
-		}
-	}()
-
-	// 片方が終了したら両方閉じる
-	<-done
-	tcp.Close()
-	ws.Close()
-	<-done
-}
