@@ -1,12 +1,15 @@
 package client
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,12 +21,20 @@ import (
 type Client struct {
 	ServerURL string // トンネルサーバーのWebSocket URL（例: "wss://tunnel.example.com"）
 	LocalAddr string // 転送先のローカルアドレス（例: "localhost:49152"）
-	AuthToken string // サーバー認証用の事前共有トークン（空の場合は認証なし）
+	UserID    string // 認証ユーザーID
+	Password  string // 認証パスワード
+
+	token string // 認証APIから取得したJWT（内部管理）
 }
 
 // Run はクライアントを起動する。コンテキストがキャンセルされるまでブロックし、
 // 切断時には指数バックオフで自動再接続する。
 func (c *Client) Run(ctx context.Context) error {
+	// 接続前に認証APIからJWTを取得
+	if err := c.fetchToken(); err != nil {
+		return fmt.Errorf("authentication failed: %w", err)
+	}
+
 	backoff := time.Second
 
 	for {
@@ -56,14 +67,52 @@ func (c *Client) Run(ctx context.Context) error {
 	}
 }
 
-// authHeader は認証用のHTTPヘッダーを返す。トークン未設定の場合はnilを返す。
+// authHeader は認証用のHTTPヘッダーを返す。
 func (c *Client) authHeader() http.Header {
-	if c.AuthToken == "" {
+	if c.token == "" {
 		return nil
 	}
 	h := http.Header{}
-	h.Set("Authorization", "Bearer "+c.AuthToken)
+	h.Set("Authorization", "Bearer "+c.token)
 	return h
+}
+
+// fetchToken は認証APIからJWTを取得する。
+// ServerURLのwss://をhttps://に変換し、/token エンドポイントにPOSTする。
+func (c *Client) fetchToken() error {
+	// wss://example.com → https://example.com/token
+	authURL := strings.Replace(c.ServerURL, "wss://", "https://", 1)
+	authURL = strings.Replace(authURL, "ws://", "http://", 1)
+	authURL += "/token"
+
+	body, _ := json.Marshal(map[string]string{
+		"user_id":  c.UserID,
+		"password": c.Password,
+	})
+
+	resp, err := http.Post(authURL, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("auth request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		var errResp struct{ Error string }
+		json.NewDecoder(resp.Body).Decode(&errResp)
+		return fmt.Errorf("auth failed (status %d): %s", resp.StatusCode, errResp.Error)
+	}
+
+	var tokenResp struct {
+		Token     string `json:"token"`
+		ExpiresAt string `json:"expires_at"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+		return fmt.Errorf("auth response parse error: %w", err)
+	}
+
+	c.token = tokenResp.Token
+	log.Printf("[client] authenticated (expires: %s)", tokenResp.ExpiresAt)
+	return nil
 }
 
 // connect はサーバーとの制御チャネルを確立し、メッセージの受信ループを実行する。

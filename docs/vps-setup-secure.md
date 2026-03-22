@@ -61,13 +61,15 @@ mkdir -p ~/tunnel-server
 自宅PC側からバイナリをアップロードする：
 
 ```bash
-scp tunnel-server tunnel-server:~/tunnel-server/
+scp builds/tunnel-server tunnel-server:~/tunnel-server/
+scp builds/tunnel-auth tunnel-server:~/tunnel-server/
 ```
 
 VPS側で実行権限を付与：
 
 ```bash
 chmod +x ~/tunnel-server/tunnel-server
+chmod +x ~/tunnel-server/tunnel-auth
 ```
 
 ## 7. ファイアウォール設定
@@ -88,6 +90,50 @@ sudo setcap cap_net_admin+ep /home/tunnel-server-manager/tunnel-server/tunnel-se
 ```
 
 > **注意**: バイナリを更新するたびにsetcapの再実行が必要。
+
+## 7.5. 認証設定
+
+### JWT秘密鍵の生成
+
+tunnel-serverとtunnel-authで共有するHMAC秘密鍵を設定する。
+
+```bash
+openssl rand -hex 32
+```
+
+生成した値を環境変数ファイルに保存する：
+
+```bash
+cat > ~/tunnel-server/.tunnel-env << 'EOF'
+AUTH_SECRET=<上で生成した秘密鍵>
+EOF
+chmod 600 ~/tunnel-server/.tunnel-env
+```
+
+### ユーザー登録
+
+`tunnel-auth add-user` コマンドでユーザーを追加する。
+パスワードはbcryptでハッシュ化されて `users.json` に保存される。
+
+```bash
+cd ~/tunnel-server
+./tunnel-auth add-user -user <ユーザーID> -password <パスワード>
+```
+
+
+複数ユーザーを追加する場合はコマンドを繰り返す：
+
+```bash
+./tunnel-auth add-user -user user1 -password pass1
+./tunnel-auth add-user -user user2 -password pass2
+```
+
+登録済みユーザーのパスワードを変更する場合は、同じユーザーIDで再度実行する。
+
+> **注意**: `users.json` のパーミッションを確認すること。
+> ```bash
+> chmod 600 ~/tunnel-server/users.json
+> ```
 
 ## 8. Caddyのインストールと設定
 
@@ -110,7 +156,12 @@ Caddyが自動的にLet's Encrypt証明書を取得・更新する。
 ```bash
 sudo tee /etc/caddy/Caddyfile > /dev/null << 'EOF'
 <YOUR-DOMAIN> {
-    reverse_proxy localhost:8080
+    handle /token {
+        reverse_proxy localhost:8081
+    }
+    handle {
+        reverse_proxy localhost:8080
+    }
 }
 EOF
 ```
@@ -135,7 +186,8 @@ After=network.target
 Type=simple
 User=tunnel-server-manager
 WorkingDirectory=/home/tunnel-server-manager/tunnel-server
-ExecStart=/home/tunnel-server-manager/tunnel-server/tunnel-server -control :8080 -port-min 49152 -port-max 65535
+EnvironmentFile=/home/tunnel-server-manager/tunnel-server/.tunnel-env
+ExecStart=/home/tunnel-server-manager/tunnel-server/tunnel-server -control :8080 -port-min 49152 -port-max 49200 -secret ${AUTH_SECRET}
 Restart=always
 RestartSec=5
 
@@ -146,8 +198,32 @@ EOF
 sudo systemctl daemon-reload
 sudo systemctl enable tunnel-server
 sudo systemctl start tunnel-server
-sudo systemctl status tunnel-server
+```
 
+### 認証APIサービス
+
+```bash
+sudo tee /etc/systemd/system/tunnel-auth.service > /dev/null << 'EOF'
+[Unit]
+Description=Tunnel Auth API
+After=network.target
+
+[Service]
+Type=simple
+User=tunnel-server-manager
+WorkingDirectory=/home/tunnel-server-manager/tunnel-server
+EnvironmentFile=/home/tunnel-server-manager/tunnel-server/.tunnel-env
+ExecStart=/home/tunnel-server-manager/tunnel-server/tunnel-auth -addr :8081 -secret ${AUTH_SECRET} -users /home/tunnel-server-manager/tunnel-server/users.json -expiry 24h
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable tunnel-auth
+sudo systemctl start tunnel-auth
 ```
 
 ## 10. 動作確認
@@ -155,9 +231,11 @@ sudo systemctl status tunnel-server
 ```bash
 # ステータス確認
 sudo systemctl status tunnel-server
+sudo systemctl status tunnel-auth
 
 # ログ確認（リアルタイム）
 sudo journalctl -u tunnel-server -f
+sudo journalctl -u tunnel-auth -f
 ```
 
 ## 11. 自宅PCからの接続テスト
@@ -165,8 +243,10 @@ sudo journalctl -u tunnel-server -f
 自宅PC側で以下を実行：
 
 ```bash
-tunnel-client.exe -server wss://<YOUR-DOMAIN> -local localhost:25565
+tunnel-client.exe -server wss://<YOUR-DOMAIN> -local localhost:25565 -user <認証ユーザーID> -password <認証パスワード>
 ```
+
+クライアントが自動的に `https://<YOUR-DOMAIN>/token` へID/PWを送信してJWTを取得し、トンネル接続を開始する。
 
 VPS側のログに `tunnel client connected` と `assigned port` が表示されれば成功。
 クライアント側のログに表示されるポート番号を外部ユーザーに共有する。

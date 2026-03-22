@@ -14,12 +14,16 @@ func main() {
 	// コマンドライン引数の定義
 	serverURL := flag.String("server", "", "トンネルサーバーのWebSocket URL（例: wss://tunnel.example.com）")
 	localAddr := flag.String("local", "localhost:25565", "転送先のローカルアドレス")
-	authToken := flag.String("token", "", "サーバー認証用の事前共有トークン")
+	userID := flag.String("user", "", "認証ユーザーID")
+	password := flag.String("password", "", "認証パスワード")
 	flag.Parse()
 
 	// 必須パラメータのバリデーション
 	if *serverURL == "" {
 		log.Fatal("-server flag is required (e.g., -server wss://tunnel.example.com)")
+	}
+	if *userID == "" || *password == "" {
+		log.Fatal("-user and -password are required")
 	}
 
 	// SIGINT/SIGTERMでグレースフルシャットダウン
@@ -29,7 +33,8 @@ func main() {
 	c := &client.Client{
 		ServerURL: *serverURL,
 		LocalAddr: *localAddr,
-		AuthToken: *authToken,
+		UserID:    *userID,
+		Password:  *password,
 	}
 
 	log.SetFlags(log.LstdFlags | log.Lshortfile)

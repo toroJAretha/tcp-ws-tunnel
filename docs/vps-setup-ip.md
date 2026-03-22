@@ -16,14 +16,14 @@ apt update && apt upgrade -y
 ## 2. 専用ユーザー作成
 
 ```bash
-adduser tunnel-server-manageer
-usermod -aG sudo tunnel-server-manageer
+adduser tunnel-server-manager
+usermod -aG sudo tunnel-server-manager
 ```
 
-## 3. SSH鍵認証の設定（tunnel-server-manageerユーザー）
+## 3. SSH鍵認証の設定（tunnel-server-managerユーザー）
 
 ```bash
-su - tunnel-server-manageer
+su - tunnel-server-manager
 mkdir -p ~/.ssh && chmod 700 ~/.ssh
 vi ~/.ssh/authorized_keys   # 自宅PCの公開鍵を貼り付ける
 chmod 600 ~/.ssh/authorized_keys
@@ -38,7 +38,7 @@ sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd
 systemctl restart ssh
 ```
 
-以降は `tunnel-server-manageer` ユーザーでSSHログインして作業する。
+以降は `tunnel-server-manager` ユーザーでSSHログインして作業する。
 
 ## 5. SSH config設定（自宅PC側）
 
@@ -47,7 +47,7 @@ systemctl restart ssh
 ```
 Host tunnel-server
     HostName <VPS-IP>
-    User tunnel-server-manageer
+    User tunnel-server-manager
     IdentityFile ~/.ssh/id_ed25519
 ```
 
@@ -62,7 +62,7 @@ mkdir -p ~/tunnel-server
 自宅PC側からバイナリをアップロードする：
 
 ```bash
-scp tunnel-server tunnel-server:~/tunnel-server/
+scp builds/tunnel-server tunnel-server:~/tunnel-server/
 ```
 
 VPS側で実行権限を付与：
@@ -84,7 +84,7 @@ sudo ufw enable
 tunnel-serverにiptables操作権限を付与する：
 
 ```bash
-sudo setcap cap_net_admin+ep /home/tunnel-server-manageer/tunnel-server/tunnel-server
+sudo setcap cap_net_admin+ep /home/tunnel-server-manager/tunnel-server/tunnel-server
 ```
 
 > **注意**: バイナリを更新するたびにsetcapの再実行が必要。
@@ -101,9 +101,9 @@ After=network.target
 
 [Service]
 Type=simple
-User=tunnel-server-manageer
-WorkingDirectory=/home/tunnel-server-manageer/tunnel-server
-ExecStart=/home/tunnel-server-manageer/tunnel-server/tunnel-server -control :8080 -port-min 49152 -port-max 65535
+User=tunnel-server-manager
+WorkingDirectory=/home/tunnel-server-manager/tunnel-server
+ExecStart=/home/tunnel-server-manager/tunnel-server/tunnel-server -control :8080 -port-min 49152 -port-max 65535
 Restart=always
 RestartSec=5
 

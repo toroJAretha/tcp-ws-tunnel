@@ -26,10 +26,19 @@ HTTP(WebSocket)を使ったTCPトンネリングツール。ルーターのポ�
 
 ```bash
 # サーバー側（Linux向け）
-GOOS=linux GOARCH=amd64 go build -o tunnel-server ./cmd/server
+
+# bash 
+GOOS=linux GOARCH=amd64 go build -o builds/tunnel-server ./cmd/server
+GOOS=linux GOARCH=amd64 go build -o builds/tunnel-auth ./cmd/auth
+# powershell
+$env:GOOS="linux";
+$env:GOARCH="amd64";
+go build -o builds/tunnel-server ./cmd/server;  
+go build -o builds/tunnel-auth ./cmd/auth; $env:GOOS="";
+$env:GOARCH=""
 
 # クライアント（Windows向け）
-go build -o tunnel-client.exe ./cmd/client
+go build -o builds/tunnel-client.exe ./cmd/client
 ```
 
 ## 使い方
