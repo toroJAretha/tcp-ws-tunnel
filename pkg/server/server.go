@@ -16,6 +16,21 @@ import (
 	"github.com/toroJ/port-tunnel/pkg/protocol"
 )
 
+// エラーコード定義
+// E1xxx: 認証エラー
+// E2xxx: リソース制限エラー
+// E3xxx: リクエストエラー
+// E5xxx: サーバー内部エラー
+const (
+	ErrCodeTokenMissing  = "E1001" // トークンが未指定
+	ErrCodeTokenInvalid  = "E1002" // トークンが無効または期限切れ
+	ErrCodeForbidden     = "E1003" // アクセス権限なし
+	ErrCodeTunnelLimit   = "E2001" // トンネル数の上限超過
+	ErrCodeBadRequest    = "E3001" // リクエストパラメータ不正
+	ErrCodeNotFound      = "E3002" // リソースが見つからない
+	ErrCodePortExhausted = "E5001" // ポート割り当て失敗
+)
+
 // WebSocketアップグレーダー（全オリジン許可）
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
@@ -138,8 +153,8 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (string, b
 	auth := r.Header.Get("Authorization")
 	tokenStr := strings.TrimPrefix(auth, "Bearer ")
 	if tokenStr == "" || tokenStr == auth {
-		log.Printf("[server] missing token from %s", r.RemoteAddr)
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		log.Printf("[server] %s: missing token from %s", ErrCodeTokenMissing, r.RemoteAddr)
+		http.Error(w, ErrCodeTokenMissing, http.StatusUnauthorized)
 		return "", false
 	}
 
@@ -150,8 +165,8 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (string, b
 		return []byte(s.JWTSecret), nil
 	})
 	if err != nil || !token.Valid {
-		log.Printf("[server] invalid token from %s: %v", r.RemoteAddr, err)
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		log.Printf("[server] %s: invalid token from %s: %v", ErrCodeTokenInvalid, r.RemoteAddr, err)
+		http.Error(w, ErrCodeTokenInvalid, http.StatusUnauthorized)
 		return "", false
 	}
 
@@ -185,7 +200,7 @@ func (s *Server) handleControl(ctx context.Context, w http.ResponseWriter, r *ht
 			s.mu.Unlock()
 			log.Printf("[server] user %s exceeded max tunnels (%d)", userID, s.MaxPerUser)
 			ws.WriteMessage(websocket.CloseMessage,
-				websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "max tunnels per user exceeded"))
+				websocket.FormatCloseMessage(websocket.ClosePolicyViolation, ErrCodeTunnelLimit))
 			ws.Close()
 			return
 		}
@@ -196,7 +211,7 @@ func (s *Server) handleControl(ctx context.Context, w http.ResponseWriter, r *ht
 		s.mu.Unlock()
 		log.Printf("[server] port allocation failed: %v", err)
 		ws.WriteMessage(websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseInternalServerErr, err.Error()))
+			websocket.FormatCloseMessage(websocket.CloseInternalServerErr, ErrCodePortExhausted))
 		ws.Close()
 		return
 	}
@@ -324,7 +339,7 @@ func (s *Server) handleControl(ctx context.Context, w http.ResponseWriter, r *ht
 func (s *Server) handleData(w http.ResponseWriter, r *http.Request, userID string) {
 	connID := r.URL.Query().Get("id")
 	if connID == "" {
-		http.Error(w, "missing id parameter", http.StatusBadRequest)
+		http.Error(w, ErrCodeBadRequest, http.StatusBadRequest)
 		return
 	}
 
@@ -333,7 +348,7 @@ func (s *Server) handleData(w http.ResponseWriter, r *http.Request, userID strin
 	p, ok := s.pending[connID]
 	if !ok {
 		s.mu.Unlock()
-		http.Error(w, "unknown connection id", http.StatusNotFound)
+		http.Error(w, ErrCodeNotFound, http.StatusNotFound)
 		return
 	}
 
@@ -352,7 +367,7 @@ func (s *Server) handleData(w http.ResponseWriter, r *http.Request, userID strin
 	if !ownerMatch {
 		s.mu.Unlock()
 		log.Printf("[server] user %s attempted to access connection %s owned by another user", userID, connID[:8])
-		http.Error(w, "forbidden", http.StatusForbidden)
+		http.Error(w, ErrCodeForbidden, http.StatusForbidden)
 		return
 	}
 

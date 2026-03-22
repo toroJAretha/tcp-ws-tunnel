@@ -96,14 +96,26 @@ tunnel-client.exe -server wss://<YOUR-DOMAIN> -local localhost:25565
 ## セキュリティ
 
 - Caddy + TLSによるWebSocket通信の暗号化（wss://）
+- JWT認証（認証APIでトークン発行、HMAC-SHA256署名検証）
+- データチャネルのセッション紐付け（他ユーザーの接続乗っ取り防止）
+- 1ユーザーあたりのトンネル数制限（リソース枯渇防止）
+- bcryptによるパスワードハッシュ化（サーバー側）
+- DPAPIによるパスワード暗号化（クライアントGUI側）
 - ランダムポート割り当てによるポート推測の困難化
 - レート制限によるポートスキャン対策
+- エラーコードのみ返却（内部情報の非公開）
 
-VPSでのレート制限設定：
-```bash
-sudo iptables -A INPUT -p tcp --dport 49152:65535 -m state --state NEW -m recent --set
-sudo iptables -A INPUT -p tcp --dport 49152:65535 -m state --state NEW -m recent --update --seconds 10 --hitcount 3 -j DROP
-```
+## エラーコード
+
+| コード | 意味 |
+|--------|------|
+| `E1001` | トークン未指定 |
+| `E1002` | トークン無効・期限切れ |
+| `E1003` | アクセス権限なし |
+| `E2001` | トンネル数の上限超過 |
+| `E3001` | リクエストパラメータ不正 |
+| `E3002` | リソースが見つからない |
+| `E5001` | ポート割り当て失敗 |
 
 ## セットアップ
 
