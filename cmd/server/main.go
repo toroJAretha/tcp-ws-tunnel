@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"log"
+	"os"
 	"os/signal"
 	"syscall"
 
@@ -15,9 +16,14 @@ func main() {
 	controlAddr := flag.String("control", ":8080", "クライアントが接続するHTTP/WSアドレス")
 	portMin := flag.Int("port-min", 49152, "ランダムポート割り当て範囲の下限")
 	portMax := flag.Int("port-max", 65535, "ランダムポート割り当て範囲の上限")
-	jwtSecret := flag.String("secret", "", "JWT署名検証用のHMAC秘密鍵（未設定の場合は認証なし）")
+	jwtSecret := flag.String("secret", "", "JWT署名検証用のHMAC秘密鍵（未設定の場合は環境変数AUTH_SECRETを参照）")
 	maxPerUser := flag.Int("max-per-user", 1, "1ユーザーあたりの最大トンネル数（0で無制限）")
 	flag.Parse()
+
+	// フラグ未設定の場合は環境変数から取得
+	if *jwtSecret == "" {
+		*jwtSecret = os.Getenv("AUTH_SECRET")
+	}
 
 	if *portMin < 1 || *portMax > 65535 || *portMin > *portMax {
 		log.Fatal("invalid port range: port-min must be <= port-max and within 1-65535")

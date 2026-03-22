@@ -23,6 +23,14 @@ type ControlMessage struct {
 	Error        string `json:"error,omitempty"`         // エラー内容
 }
 
+// ShortID はIDの先頭8文字を返す。8文字未満の場合はそのまま返す。
+func ShortID(id string) string {
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:8]
+}
+
 // GenerateConnectionID はランダムな16バイトの16進数文字列を生成する。
 func GenerateConnectionID() (string, error) {
 	b := make([]byte, 16)

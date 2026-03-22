@@ -3,6 +3,7 @@ package auth
 import (
 	"encoding/json"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -13,6 +14,81 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
 )
+
+// rateLimiter はIPアドレスごとの認証試行を制限する。
+type rateLimiter struct {
+	mu       sync.Mutex
+	attempts map[string][]time.Time
+	max      int           // 期間内の最大試行回数
+	window   time.Duration // 制限ウィンドウ
+}
+
+func newRateLimiter(max int, window time.Duration) *rateLimiter {
+	rl := &rateLimiter{
+		attempts: make(map[string][]time.Time),
+		max:      max,
+		window:   window,
+	}
+	// 定期的に期限切れエントリを掃除
+	go func() {
+		ticker := time.NewTicker(window)
+		defer ticker.Stop()
+		for range ticker.C {
+			rl.cleanup()
+		}
+	}()
+	return rl
+}
+
+// cleanup は期限切れのエントリをマップから削除する。
+func (rl *rateLimiter) cleanup() {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	cutoff := time.Now().Add(-rl.window)
+	for ip, times := range rl.attempts {
+		valid := times[:0]
+		for _, t := range times {
+			if t.After(cutoff) {
+				valid = append(valid, t)
+			}
+		}
+		if len(valid) == 0 {
+			delete(rl.attempts, ip)
+		} else {
+			rl.attempts[ip] = valid
+		}
+	}
+}
+
+// allow は指定IPの試行を許可するかを返す。
+func (rl *rateLimiter) allow(ip string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	now := time.Now()
+	cutoff := now.Add(-rl.window)
+
+	// 期限切れのエントリを除去
+	valid := rl.attempts[ip][:0]
+	for _, t := range rl.attempts[ip] {
+		if t.After(cutoff) {
+			valid = append(valid, t)
+		}
+	}
+
+	if len(valid) == 0 {
+		delete(rl.attempts, ip)
+	}
+
+	if len(valid) >= rl.max {
+		rl.attempts[ip] = valid
+		return false
+	}
+
+	rl.attempts[ip] = append(valid, now)
+	return true
+}
 
 // User はユーザー情報を保持する。
 type User struct {
@@ -26,8 +102,9 @@ type Server struct {
 	UsersFile string // ユーザー情報JSONファイルのパス
 	Expiry    string // JWTの有効期限（例: "24h", "7d"）
 
-	mu    sync.RWMutex
-	users []User
+	mu      sync.RWMutex
+	users   []User
+	limiter *rateLimiter
 }
 
 // tokenRequest はトークン発行リクエストのJSON構造。
@@ -64,11 +141,9 @@ func (s *Server) LoadUsers() error {
 	return json.Unmarshal(data, &s.users)
 }
 
-// SaveUsers はユーザー情報をJSONファイルに保存する。
-func (s *Server) SaveUsers() error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
+// saveUsersLocked はユーザー情報をJSONファイルに保存する。
+// 呼び出し元がs.muを保持していること。
+func (s *Server) saveUsersLocked() error {
 	data, err := json.MarshalIndent(s.users, "", "  ")
 	if err != nil {
 		return err
@@ -85,17 +160,17 @@ func (s *Server) AddUser(userID, password string) error {
 	}
 
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	// 既存ユーザーの更新チェック
 	for i, u := range s.users {
 		if u.UserID == userID {
 			s.users[i].PasswordHash = string(hash)
-			s.mu.Unlock()
-			return s.SaveUsers()
+			return s.saveUsersLocked()
 		}
 	}
 	s.users = append(s.users, User{UserID: userID, PasswordHash: string(hash)})
-	s.mu.Unlock()
-	return s.SaveUsers()
+	return s.saveUsersLocked()
 }
 
 // authenticate はユーザーIDとパスワードを検証する。
@@ -113,6 +188,8 @@ func (s *Server) authenticate(userID, password string) bool {
 
 // Handler はHTTPハンドラを返す。
 func (s *Server) Handler() http.Handler {
+	// 1分間に最大5回の認証試行を許可
+	s.limiter = newRateLimiter(5, time.Minute)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/token", s.handleToken)
 	return mux
@@ -139,7 +216,19 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// レートリミットチェック
+	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if ip == "" {
+		ip = r.RemoteAddr
+	}
+	if !s.limiter.allow(ip) {
+		log.Printf("[auth] rate limit exceeded from %s", r.RemoteAddr)
+		writeJSON(w, http.StatusTooManyRequests, errorResponse{Error: "too many requests"})
+		return
+	}
+
 	var req tokenRequest
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid request body"})
 		return

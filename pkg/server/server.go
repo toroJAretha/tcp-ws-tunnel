@@ -31,9 +31,13 @@ const (
 	ErrCodePortExhausted = "E5001" // ポート割り当て失敗
 )
 
-// WebSocketアップグレーダー（全オリジン許可）
+// WebSocketアップグレーダー
+// Originヘッダーなし（CLIクライアント）は許可、あり（ブラウザ経由）は拒否
+// 注意: CSRF防御は主にJWT認証に依存する。Originチェックは補助的な防御層。
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin: func(r *http.Request) bool {
+		return r.Header.Get("Origin") == ""
+	},
 }
 
 // pendingConn はデータチャネルの確立を待っているTCP接続を保持する。
@@ -47,6 +51,7 @@ type pendingConn struct {
 type tunnel struct {
 	id         string           // トンネルの一意なID
 	ownerID    string           // トンネル所有者のユーザーID
+	clientIP   string           // クライアントの接続元IPアドレス
 	publicPort int              // 外部に公開するポート番号
 	controlWS  *websocket.Conn  // クライアントとの制御チャネル
 	controlMu  sync.Mutex       // 制御チャネルへの書き込みを直列化するミューテックス
@@ -62,14 +67,16 @@ type Server struct {
 	JWTSecret      string // JWT署名検証用のHMAC秘密鍵（空の場合は認証なし）
 	MaxPerUser     int    // 1ユーザーあたりの最大トンネル数（0の場合は制限なし）
 
-	mu      sync.Mutex
-	tunnels map[int]*tunnel         // 公開ポート番号をキーとしたトンネルマップ
-	pending map[string]*pendingConn // 接続IDをキーとした待機中のTCP接続マップ
+	mu        sync.Mutex
+	tunnels   map[int]*tunnel         // 公開ポート番号をキーとしたトンネルマップ
+	tunnelsByID map[string]*tunnel    // トンネルIDをキーとした逆引きマップ
+	pending   map[string]*pendingConn // 接続IDをキーとした待機中のTCP接続マップ
 }
 
 // Run はサーバーを起動する。コンテキストがキャンセルされるまでブロックする。
 func (s *Server) Run(ctx context.Context) error {
 	s.tunnels = make(map[int]*tunnel)
+	s.tunnelsByID = make(map[string]*tunnel)
 	s.pending = make(map[string]*pendingConn)
 
 	// HTTPルーティングの設定
@@ -90,17 +97,22 @@ func (s *Server) Run(ctx context.Context) error {
 	})
 
 	httpServer := &http.Server{
-		Addr:    s.ControlAddr,
-		Handler: mux,
+		Addr:              s.ControlAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	// タイムアウトした待機中接続の定期クリーンアップ
 	go s.cleanupPending(ctx)
 
-	// コンテキストキャンセル時にHTTPサーバーをシャットダウン
+	// コンテキストキャンセル時にHTTPサーバーをシャットダウン（10秒タイムアウト）
 	go func() {
 		<-ctx.Done()
-		httpServer.Shutdown(context.Background())
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("[server] http shutdown error: %v", err)
+		}
 	}()
 
 	// ファイアウォールのカスタムチェーンを初期化
@@ -111,6 +123,9 @@ func (s *Server) Run(ctx context.Context) error {
 		defer cleanupFirewall(s.PortMin, s.PortMax)
 	}
 
+	if s.JWTSecret == "" {
+		log.Printf("[server] WARNING: -secret is not set. Authentication, per-user tunnel limits, and session binding are disabled.")
+	}
 	log.Printf("[server] control channel: %s, port range: %d-%d", s.ControlAddr, s.PortMin, s.PortMax)
 	if err := httpServer.ListenAndServe(); err != http.ErrServerClosed {
 		return fmt.Errorf("http server: %w", err)
@@ -118,30 +133,19 @@ func (s *Server) Run(ctx context.Context) error {
 	return nil
 }
 
-// allocatePort はポート範囲内から未使用のランダムポートを割り当てる。
-// 空きがない場合はエラーを返す。
-func (s *Server) allocatePort() (int, net.Listener, error) {
+// candidatePorts はs.muを保持した状態で、未使用のポート候補リストを返す。
+// 呼び出し元がs.muを保持していること。
+func (s *Server) candidatePorts() []int {
 	portRange := s.PortMax - s.PortMin + 1
-
-	// ランダムな開始位置から順に空きポートを探す
 	start := rand.Intn(portRange)
+	candidates := make([]int, 0, portRange)
 	for i := 0; i < portRange; i++ {
 		port := s.PortMin + (start+i)%portRange
-
-		if _, exists := s.tunnels[port]; exists {
-			continue
+		if _, exists := s.tunnels[port]; !exists {
+			candidates = append(candidates, port)
 		}
-
-		listenAddr := fmt.Sprintf(":%d", port)
-		listener, err := net.Listen("tcp", listenAddr)
-		if err != nil {
-			continue // OSレベルで使用中の場合はスキップ
-		}
-
-		return port, listener, nil
 	}
-
-	return 0, nil, fmt.Errorf("no available port in range %d-%d", s.PortMin, s.PortMax)
+	return candidates
 }
 
 // authenticate はリクエストのAuthorizationヘッダーのJWTを検証し、ユーザーIDを返す。
@@ -172,6 +176,11 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (string, b
 
 	// JWTのsubjectからユーザーIDを取得
 	subject, _ := token.Claims.GetSubject()
+	if subject == "" {
+		log.Printf("[server] %s: empty subject in token from %s", ErrCodeTokenInvalid, r.RemoteAddr)
+		http.Error(w, ErrCodeTokenInvalid, http.StatusUnauthorized)
+		return "", false
+	}
 	return subject, true
 }
 
@@ -185,10 +194,8 @@ func (s *Server) handleControl(ctx context.Context, w http.ResponseWriter, r *ht
 		return
 	}
 
-	// ランダムポートを割り当て
+	// 1ユーザーあたりのトンネル数制限チェックとポート候補取得（ロック内）
 	s.mu.Lock()
-
-	// 1ユーザーあたりのトンネル数制限チェック
 	if s.MaxPerUser > 0 && userID != "" {
 		count := 0
 		for _, t := range s.tunnels {
@@ -205,29 +212,67 @@ func (s *Server) handleControl(ctx context.Context, w http.ResponseWriter, r *ht
 			return
 		}
 	}
+	candidates := s.candidatePorts()
+	s.mu.Unlock()
 
-	port, listener, err := s.allocatePort()
-	if err != nil {
-		s.mu.Unlock()
-		log.Printf("[server] port allocation failed: %v", err)
+	// ポート候補に対してnet.Listenを試行（ロック外）
+	var port int
+	var listener net.Listener
+	for _, p := range candidates {
+		l, err := net.Listen("tcp", fmt.Sprintf(":%d", p))
+		if err != nil {
+			continue
+		}
+		port = p
+		listener = l
+		break
+	}
+	if listener == nil {
+		log.Printf("[server] port allocation failed: no available port in range %d-%d", s.PortMin, s.PortMax)
 		ws.WriteMessage(websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseInternalServerErr, ErrCodePortExhausted))
 		ws.Close()
 		return
 	}
 
-	tunnelID, _ := protocol.GenerateConnectionID()
+	tunnelID, err := protocol.GenerateConnectionID()
+	if err != nil {
+		listener.Close()
+		log.Printf("[server] %s: failed to generate tunnel id: %v", ErrCodePortExhausted, err)
+		ws.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseInternalServerErr, ErrCodePortExhausted))
+		ws.Close()
+		return
+	}
 	tunnelCtx, tunnelCancel := context.WithCancel(ctx)
+
+	// クライアントIPを取得
+	clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
 
 	t := &tunnel{
 		id:         tunnelID,
 		ownerID:    userID,
+		clientIP:   clientIP,
 		publicPort: port,
 		controlWS:  ws,
 		listener:   listener,
 	}
 
+	// ポートをマップに登録（ロック内）
+	s.mu.Lock()
+	// 競合チェック：別のgoroutineが同じポートを先に取った場合
+	if _, exists := s.tunnels[port]; exists {
+		s.mu.Unlock()
+		listener.Close()
+		tunnelCancel()
+		log.Printf("[server] port %d was taken by another tunnel", port)
+		ws.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseInternalServerErr, ErrCodePortExhausted))
+		ws.Close()
+		return
+	}
 	s.tunnels[port] = t
+	s.tunnelsByID[tunnelID] = t
 	s.mu.Unlock()
 
 	// ファイアウォールでポートを開放
@@ -245,8 +290,12 @@ func (s *Server) handleControl(ctx context.Context, w http.ResponseWriter, r *ht
 	if err != nil {
 		tunnelCancel()
 		listener.Close()
+		if closeErr := closePort(port); closeErr != nil {
+			log.Printf("[server] firewall close failed (port %d): %v", port, closeErr)
+		}
 		s.mu.Lock()
 		delete(s.tunnels, port)
+		delete(s.tunnelsByID, tunnelID)
 		s.mu.Unlock()
 		ws.Close()
 		return
@@ -270,6 +319,7 @@ func (s *Server) handleControl(ctx context.Context, w http.ResponseWriter, r *ht
 		s.mu.Lock()
 		// トンネルをマップから削除
 		delete(s.tunnels, port)
+		delete(s.tunnelsByID, tunnelID)
 		// このトンネルに属する待機中の接続をすべて閉じる
 		for id, p := range s.pending {
 			if p.tunnelID == tunnelID {
@@ -352,21 +402,25 @@ func (s *Server) handleData(w http.ResponseWriter, r *http.Request, userID strin
 		return
 	}
 
-	// 接続IDの所有者を検証（トンネルの所有者とJWTのユーザーIDが一致するか）
+	// 接続IDの所有者を検証
 	ownerMatch := true
-	if userID != "" {
-		for _, t := range s.tunnels {
-			if t.id == p.tunnelID {
-				if t.ownerID != userID {
-					ownerMatch = false
-				}
-				break
+	if t, ok := s.tunnelsByID[p.tunnelID]; ok {
+		if userID != "" {
+			// JWT認証モード: ユーザーIDで照合
+			if t.ownerID != userID {
+				ownerMatch = false
+			}
+		} else {
+			// 認証なしモード: クライアントIPで照合
+			reqIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+			if t.clientIP != reqIP {
+				ownerMatch = false
 			}
 		}
 	}
 	if !ownerMatch {
 		s.mu.Unlock()
-		log.Printf("[server] user %s attempted to access connection %s owned by another user", userID, connID[:8])
+		log.Printf("[server] user %s attempted to access connection %s owned by another user", userID, protocol.ShortID(connID))
 		http.Error(w, ErrCodeForbidden, http.StatusForbidden)
 		return
 	}
@@ -382,9 +436,9 @@ func (s *Server) handleData(w http.ResponseWriter, r *http.Request, userID strin
 		return
 	}
 
-	log.Printf("[server] data channel established for connection %s", connID[:8])
+	log.Printf("[server] data channel established for connection %s", protocol.ShortID(connID))
 	// TCP接続とWebSocket間で双方向データ転送を開始
-	bridge(p.conn, ws)
+	protocol.Bridge(p.conn, ws)
 }
 
 // acceptTCP は指定リスナーでTCP接続を受け付け、それぞれgoroutineで処理する。
@@ -421,7 +475,7 @@ func (s *Server) handleTCPConn(conn net.Conn, t *tunnel) {
 	s.pending[connID] = &pendingConn{conn: conn, tunnelID: t.id, created: time.Now()}
 	s.mu.Unlock()
 
-	log.Printf("[server] new connection %s from %s (port %d)", connID[:8], conn.RemoteAddr(), t.publicPort)
+	log.Printf("[server] new connection %s from %s (port %d)", protocol.ShortID(connID), conn.RemoteAddr(), t.publicPort)
 
 	// 制御チャネル経由でクライアントに新規接続を通知
 	msg := protocol.ControlMessage{
@@ -456,7 +510,7 @@ func (s *Server) cleanupPending(ctx context.Context) {
 			now := time.Now()
 			for id, p := range s.pending {
 				if now.Sub(p.created) > 10*time.Second {
-					log.Printf("[server] pending connection %s timed out", id[:8])
+					log.Printf("[server] pending connection %s timed out", protocol.ShortID(id))
 					p.conn.Close()
 					delete(s.pending, id)
 				}
@@ -466,43 +520,3 @@ func (s *Server) cleanupPending(ctx context.Context) {
 	}
 }
 
-// bridge はTCP接続とWebSocket間でデータを双方向にコピーする。
-// いずれか一方が終了すると、両方の接続を閉じる。
-func bridge(tcp net.Conn, ws *websocket.Conn) {
-	done := make(chan struct{}, 2)
-
-	// TCP → WebSocket
-	go func() {
-		defer func() { done <- struct{}{} }()
-		buf := make([]byte, 32*1024)
-		for {
-			n, err := tcp.Read(buf)
-			if err != nil {
-				return
-			}
-			if err := ws.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
-				return
-			}
-		}
-	}()
-
-	// WebSocket → TCP
-	go func() {
-		defer func() { done <- struct{}{} }()
-		for {
-			_, data, err := ws.ReadMessage()
-			if err != nil {
-				return
-			}
-			if _, err := tcp.Write(data); err != nil {
-				return
-			}
-		}
-	}()
-
-	// 片方が終了したら両方閉じる
-	<-done
-	tcp.Close()
-	ws.Close()
-	<-done
-}
