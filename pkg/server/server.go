@@ -31,6 +31,7 @@ type pendingConn struct {
 // tunnel は1つのクライアントのトンネルセッションを表す。
 type tunnel struct {
 	id         string           // トンネルの一意なID
+	ownerID    string           // トンネル所有者のユーザーID
 	publicPort int              // 外部に公開するポート番号
 	controlWS  *websocket.Conn  // クライアントとの制御チャネル
 	controlMu  sync.Mutex       // 制御チャネルへの書き込みを直列化するミューテックス
@@ -58,16 +59,18 @@ func (s *Server) Run(ctx context.Context) error {
 	// HTTPルーティングの設定
 	mux := http.NewServeMux()
 	mux.HandleFunc("/control", func(w http.ResponseWriter, r *http.Request) {
-		if !s.authenticate(w, r) {
+		userID, ok := s.authenticate(w, r)
+		if !ok {
 			return
 		}
-		s.handleControl(ctx, w, r)
+		s.handleControl(ctx, w, r, userID)
 	})
 	mux.HandleFunc("/data", func(w http.ResponseWriter, r *http.Request) {
-		if !s.authenticate(w, r) {
+		userID, ok := s.authenticate(w, r)
+		if !ok {
 			return
 		}
-		s.handleData(w, r)
+		s.handleData(w, r, userID)
 	})
 
 	httpServer := &http.Server{
@@ -125,18 +128,18 @@ func (s *Server) allocatePort() (int, net.Listener, error) {
 	return 0, nil, fmt.Errorf("no available port in range %d-%d", s.PortMin, s.PortMax)
 }
 
-// authenticate はリクエストのAuthorizationヘッダーのJWTを検証する。
+// authenticate はリクエストのAuthorizationヘッダーのJWTを検証し、ユーザーIDを返す。
 // JWTSecret未設定の場合は常に許可する。接続時のみ検証し、接続中は再検証しない。
-func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) bool {
+func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (string, bool) {
 	if s.JWTSecret == "" {
-		return true
+		return "", true
 	}
 	auth := r.Header.Get("Authorization")
 	tokenStr := strings.TrimPrefix(auth, "Bearer ")
 	if tokenStr == "" || tokenStr == auth {
 		log.Printf("[server] missing token from %s", r.RemoteAddr)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return false
+		return "", false
 	}
 
 	token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
@@ -148,15 +151,17 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) bool {
 	if err != nil || !token.Valid {
 		log.Printf("[server] invalid token from %s: %v", r.RemoteAddr, err)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return false
+		return "", false
 	}
 
-	return true
+	// JWTのsubjectからユーザーIDを取得
+	subject, _ := token.Claims.GetSubject()
+	return subject, true
 }
 
 // handleControl はクライアントからの制御チャネル接続を処理する。
 // ランダムなポートを割り当て、クライアントに通知する。
-func (s *Server) handleControl(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleControl(ctx context.Context, w http.ResponseWriter, r *http.Request, userID string) {
 	// HTTPからWebSocketへアップグレード
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -181,6 +186,7 @@ func (s *Server) handleControl(ctx context.Context, w http.ResponseWriter, r *ht
 
 	t := &tunnel{
 		id:         tunnelID,
+		ownerID:    userID,
 		publicPort: port,
 		controlWS:  ws,
 		listener:   listener,
@@ -295,7 +301,7 @@ func (s *Server) handleControl(ctx context.Context, w http.ResponseWriter, r *ht
 
 // handleData はクライアントからのデータチャネル接続を処理する。
 // 待機中のTCP接続とWebSocketを紐付けて双方向転送を開始する。
-func (s *Server) handleData(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleData(w http.ResponseWriter, r *http.Request, userID string) {
 	connID := r.URL.Query().Get("id")
 	if connID == "" {
 		http.Error(w, "missing id parameter", http.StatusBadRequest)
@@ -310,6 +316,26 @@ func (s *Server) handleData(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown connection id", http.StatusNotFound)
 		return
 	}
+
+	// 接続IDの所有者を検証（トンネルの所有者とJWTのユーザーIDが一致するか）
+	ownerMatch := true
+	if userID != "" {
+		for _, t := range s.tunnels {
+			if t.id == p.tunnelID {
+				if t.ownerID != userID {
+					ownerMatch = false
+				}
+				break
+			}
+		}
+	}
+	if !ownerMatch {
+		s.mu.Unlock()
+		log.Printf("[server] user %s attempted to access connection %s owned by another user", userID, connID[:8])
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
 	delete(s.pending, connID)
 	s.mu.Unlock()
 
