@@ -16,8 +16,10 @@ const chainName = "TUNNEL"
 // サーバー起動時に1回だけ呼び出す。
 func initFirewall(portMin, portMax int) error {
 	// チェーンが既に存在する場合はフラッシュ
-	exec.Command("iptables", "-N", chainName).Run()
-	exec.Command("iptables", "-F", chainName).Run()
+	exec.Command("iptables", "-N", chainName).Run() // 既存の場合はエラーになるが無視
+	if err := exec.Command("iptables", "-F", chainName).Run(); err != nil {
+		log.Printf("[firewall] warning: failed to flush chain %s: %v", chainName, err)
+	}
 
 	// ポート範囲宛のパケットをTUNNELチェーンに転送するルールを追加
 	// 重複防止のため既存ルールを先に削除
