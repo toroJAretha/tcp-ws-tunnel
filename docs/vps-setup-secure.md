@@ -187,7 +187,7 @@ Type=simple
 User=tunnel-server-manager
 WorkingDirectory=/home/tunnel-server-manager/tunnel-server
 EnvironmentFile=/home/tunnel-server-manager/tunnel-server/.tunnel-env
-ExecStart=/home/tunnel-server-manager/tunnel-server/tunnel-server -control :8080 -port-min 49152 -port-max 49200 -secret ${AUTH_SECRET}
+ExecStart=/home/tunnel-server-manager/tunnel-server/tunnel-server -control :8080 -port-min 49152 -port-max 49200 -secret ${AUTH_SECRET} -max-per-user 1
 Restart=always
 RestartSec=5
 

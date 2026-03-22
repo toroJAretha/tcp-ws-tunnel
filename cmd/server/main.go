@@ -16,6 +16,7 @@ func main() {
 	portMin := flag.Int("port-min", 49152, "ランダムポート割り当て範囲の下限")
 	portMax := flag.Int("port-max", 65535, "ランダムポート割り当て範囲の上限")
 	jwtSecret := flag.String("secret", "", "JWT署名検証用のHMAC秘密鍵（未設定の場合は認証なし）")
+	maxPerUser := flag.Int("max-per-user", 1, "1ユーザーあたりの最大トンネル数（0で無制限）")
 	flag.Parse()
 
 	if *portMin < 1 || *portMax > 65535 || *portMin > *portMax {
@@ -31,6 +32,7 @@ func main() {
 		PortMin:     *portMin,
 		PortMax:     *portMax,
 		JWTSecret:   *jwtSecret,
+		MaxPerUser:  *maxPerUser,
 	}
 
 	log.SetFlags(log.LstdFlags | log.Lshortfile)

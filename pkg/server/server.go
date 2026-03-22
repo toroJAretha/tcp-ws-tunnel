@@ -41,10 +41,11 @@ type tunnel struct {
 // Server は外部公開用のトンネルサーバー。
 // 複数のクライアントが同時に異なるポートでトンネルを作成できる。
 type Server struct {
-	ControlAddr string // HTTP/WSリッスンアドレス（例: ":8080"）
-	PortMin     int    // ランダムポート割り当て範囲の下限
-	PortMax     int    // ランダムポート割り当て範囲の上限
-	JWTSecret   string // JWT署名検証用のHMAC秘密鍵（空の場合は認証なし）
+	ControlAddr    string // HTTP/WSリッスンアドレス（例: ":8080"）
+	PortMin        int    // ランダムポート割り当て範囲の下限
+	PortMax        int    // ランダムポート割り当て範囲の上限
+	JWTSecret      string // JWT署名検証用のHMAC秘密鍵（空の場合は認証なし）
+	MaxPerUser     int    // 1ユーザーあたりの最大トンネル数（0の場合は制限なし）
 
 	mu      sync.Mutex
 	tunnels map[int]*tunnel         // 公開ポート番号をキーとしたトンネルマップ
@@ -171,6 +172,25 @@ func (s *Server) handleControl(ctx context.Context, w http.ResponseWriter, r *ht
 
 	// ランダムポートを割り当て
 	s.mu.Lock()
+
+	// 1ユーザーあたりのトンネル数制限チェック
+	if s.MaxPerUser > 0 && userID != "" {
+		count := 0
+		for _, t := range s.tunnels {
+			if t.ownerID == userID {
+				count++
+			}
+		}
+		if count >= s.MaxPerUser {
+			s.mu.Unlock()
+			log.Printf("[server] user %s exceeded max tunnels (%d)", userID, s.MaxPerUser)
+			ws.WriteMessage(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "max tunnels per user exceeded"))
+			ws.Close()
+			return
+		}
+	}
+
 	port, listener, err := s.allocatePort()
 	if err != nil {
 		s.mu.Unlock()
