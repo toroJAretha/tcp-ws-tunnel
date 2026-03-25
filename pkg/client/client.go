@@ -24,7 +24,8 @@ type Client struct {
 	UserID    string // 認証ユーザーID
 	Password  string // 認証パスワード
 
-	token string // 認証APIから取得したJWT（内部管理）
+	tokenMu sync.RWMutex
+	token   string // 認証APIから取得したJWT（内部管理）
 }
 
 // Run はクライアントを起動する。コンテキストがキャンセルされるまでブロックし、
@@ -80,11 +81,14 @@ func (c *Client) Run(ctx context.Context) error {
 
 // authHeader は認証用のHTTPヘッダーを返す。
 func (c *Client) authHeader() http.Header {
-	if c.token == "" {
+	c.tokenMu.RLock()
+	t := c.token
+	c.tokenMu.RUnlock()
+	if t == "" {
 		return nil
 	}
 	h := http.Header{}
-	h.Set("Authorization", "Bearer "+c.token)
+	h.Set("Authorization", "Bearer "+t)
 	return h
 }
 
@@ -105,10 +109,13 @@ func (c *Client) fetchToken() error {
 	parsed.Path = strings.TrimRight(parsed.Path, "/") + "/token"
 	authURL := parsed.String()
 
-	body, _ := json.Marshal(map[string]string{
+	body, err := json.Marshal(map[string]string{
 		"user_id":  c.UserID,
 		"password": c.Password,
 	})
+	if err != nil {
+		return fmt.Errorf("marshal auth request: %w", err)
+	}
 
 	httpClient := &http.Client{Timeout: 10 * time.Second}
 	resp, err := httpClient.Post(authURL, "application/json", bytes.NewReader(body))
@@ -131,7 +138,9 @@ func (c *Client) fetchToken() error {
 		return fmt.Errorf("auth response parse error: %w", err)
 	}
 
+	c.tokenMu.Lock()
 	c.token = tokenResp.Token
+	c.tokenMu.Unlock()
 	log.Printf("[client] authenticated (expires: %s)", tokenResp.ExpiresAt)
 	return nil
 }

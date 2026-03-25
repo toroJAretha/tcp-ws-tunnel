@@ -154,7 +154,7 @@ DNS設定で `<YOUR-DOMAIN>` のAレコードをVPSのIPアドレスに向けて
 Caddyが自動的にLet's Encrypt証明書を取得・更新する。
 
 ```bash
-sudo tee /etc/caddy/Caddyfile > /dev/null << 'EOF'
+sudo tee /etc/caddy/tunnel.caddy > /dev/null << 'EOF'
 <YOUR-DOMAIN> {
     handle /token {
         reverse_proxy localhost:8081
@@ -163,6 +163,12 @@ sudo tee /etc/caddy/Caddyfile > /dev/null << 'EOF'
         reverse_proxy localhost:8080
     }
 }
+EOF
+```
+
+```bash
+sudo tee /etc/caddy/Caddyfile > /dev/null << 'EOF'
+    import /etc/caddy/tunnel.caddy
 EOF
 ```
 

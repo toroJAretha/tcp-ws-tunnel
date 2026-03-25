@@ -21,6 +21,7 @@ type rateLimiter struct {
 	attempts map[string][]time.Time
 	max      int           // 期間内の最大試行回数
 	window   time.Duration // 制限ウィンドウ
+	maxIPs   int           // 追跡するIPアドレスの上限
 }
 
 func newRateLimiter(max int, window time.Duration) *rateLimiter {
@@ -28,6 +29,7 @@ func newRateLimiter(max int, window time.Duration) *rateLimiter {
 		attempts: make(map[string][]time.Time),
 		max:      max,
 		window:   window,
+		maxIPs:   10000,
 	}
 	// 定期的に期限切れエントリを掃除
 	go func() {
@@ -86,6 +88,11 @@ func (rl *rateLimiter) allow(ip string) bool {
 		return false
 	}
 
+	// IPアドレス数の上限を超えた場合は新規IPを拒否
+	if len(valid) == 0 && len(rl.attempts) >= rl.maxIPs {
+		return false
+	}
+
 	rl.attempts[ip] = append(valid, now)
 	return true
 }
@@ -102,9 +109,10 @@ type Server struct {
 	UsersFile string // ユーザー情報JSONファイルのパス
 	Expiry    string // JWTの有効期限（例: "24h", "7d"）
 
-	mu      sync.RWMutex
-	users   []User
-	limiter *rateLimiter
+	mu          sync.RWMutex
+	users       []User
+	limiter     *rateLimiter
+	limiterOnce sync.Once
 }
 
 // tokenRequest はトークン発行リクエストのJSON構造。
@@ -173,6 +181,10 @@ func (s *Server) AddUser(userID, password string) error {
 	return s.saveUsersLocked()
 }
 
+// dummyHash はユーザーが存在しない場合でも一定時間のbcrypt比較を行うためのダミーハッシュ。
+// タイミング攻撃によるユーザー列挙を防止する。
+var dummyHash, _ = bcrypt.GenerateFromPassword([]byte("dummy"), bcrypt.DefaultCost)
+
 // authenticate はユーザーIDとパスワードを検証する。
 func (s *Server) authenticate(userID, password string) bool {
 	s.mu.RLock()
@@ -183,13 +195,17 @@ func (s *Server) authenticate(userID, password string) bool {
 			return bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)) == nil
 		}
 	}
+	// ユーザーが存在しなくてもbcrypt比較を実行し、応答時間を均一にする
+	bcrypt.CompareHashAndPassword(dummyHash, []byte(password))
 	return false
 }
 
 // Handler はHTTPハンドラを返す。
 func (s *Server) Handler() http.Handler {
-	// 1分間に最大5回の認証試行を許可
-	s.limiter = newRateLimiter(5, time.Minute)
+	s.limiterOnce.Do(func() {
+		// 1分間に最大5回の認証試行を許可
+		s.limiter = newRateLimiter(5, time.Minute)
+	})
 	mux := http.NewServeMux()
 	mux.HandleFunc("/token", s.handleToken)
 	return mux

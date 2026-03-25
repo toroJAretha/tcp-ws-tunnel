@@ -133,19 +133,26 @@ func (s *Server) Run(ctx context.Context) error {
 	return nil
 }
 
-// candidatePorts はs.muを保持した状態で、未使用のポート候補リストを返す。
-// 呼び出し元がs.muを保持していること。
-func (s *Server) candidatePorts() []int {
+// allocatePort はランダムな未使用ポートを割り当て、リスナーを返す。
+// ロック内でマップ確認とnet.Listenを一括で行い、競合を防ぐ。
+func (s *Server) allocatePort() (int, net.Listener, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	portRange := s.PortMax - s.PortMin + 1
 	start := rand.Intn(portRange)
-	candidates := make([]int, 0, portRange)
 	for i := 0; i < portRange; i++ {
 		port := s.PortMin + (start+i)%portRange
-		if _, exists := s.tunnels[port]; !exists {
-			candidates = append(candidates, port)
+		if _, exists := s.tunnels[port]; exists {
+			continue
 		}
+		l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		if err != nil {
+			continue
+		}
+		return port, l, nil
 	}
-	return candidates
+	return 0, nil, fmt.Errorf("no available port in range %d-%d", s.PortMin, s.PortMax)
 }
 
 // authenticate はリクエストのAuthorizationヘッダーのJWTを検証し、ユーザーIDを返す。
@@ -194,17 +201,18 @@ func (s *Server) handleControl(ctx context.Context, w http.ResponseWriter, r *ht
 		return
 	}
 
-	// 1ユーザーあたりのトンネル数制限チェックとポート候補取得（ロック内）
-	s.mu.Lock()
+	// 1ユーザーあたりのトンネル数制限チェック（ロック内）
 	if s.MaxPerUser > 0 && userID != "" {
+		s.mu.Lock()
 		count := 0
 		for _, t := range s.tunnels {
 			if t.ownerID == userID {
 				count++
 			}
 		}
-		if count >= s.MaxPerUser {
-			s.mu.Unlock()
+		exceeded := count >= s.MaxPerUser
+		s.mu.Unlock()
+		if exceeded {
 			log.Printf("[server] user %s exceeded max tunnels (%d)", userID, s.MaxPerUser)
 			ws.WriteMessage(websocket.CloseMessage,
 				websocket.FormatCloseMessage(websocket.ClosePolicyViolation, ErrCodeTunnelLimit))
@@ -212,23 +220,11 @@ func (s *Server) handleControl(ctx context.Context, w http.ResponseWriter, r *ht
 			return
 		}
 	}
-	candidates := s.candidatePorts()
-	s.mu.Unlock()
 
-	// ポート候補に対してnet.Listenを試行（ロック外）
-	var port int
-	var listener net.Listener
-	for _, p := range candidates {
-		l, err := net.Listen("tcp", fmt.Sprintf(":%d", p))
-		if err != nil {
-			continue
-		}
-		port = p
-		listener = l
-		break
-	}
-	if listener == nil {
-		log.Printf("[server] port allocation failed: no available port in range %d-%d", s.PortMin, s.PortMax)
+	// ポート割り当て（ロック内でマップ確認とListenを一括実行）
+	port, listener, err := s.allocatePort()
+	if err != nil {
+		log.Printf("[server] port allocation failed: %v", err)
 		ws.WriteMessage(websocket.CloseMessage,
 			websocket.FormatCloseMessage(websocket.CloseInternalServerErr, ErrCodePortExhausted))
 		ws.Close()
@@ -260,17 +256,6 @@ func (s *Server) handleControl(ctx context.Context, w http.ResponseWriter, r *ht
 
 	// ポートをマップに登録（ロック内）
 	s.mu.Lock()
-	// 競合チェック：別のgoroutineが同じポートを先に取った場合
-	if _, exists := s.tunnels[port]; exists {
-		s.mu.Unlock()
-		listener.Close()
-		tunnelCancel()
-		log.Printf("[server] port %d was taken by another tunnel", port)
-		ws.WriteMessage(websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseInternalServerErr, ErrCodePortExhausted))
-		ws.Close()
-		return
-	}
 	s.tunnels[port] = t
 	s.tunnelsByID[tunnelID] = t
 	s.mu.Unlock()
@@ -441,8 +426,13 @@ func (s *Server) handleData(w http.ResponseWriter, r *http.Request, userID strin
 	protocol.Bridge(p.conn, ws)
 }
 
+// maxConnsPerTunnel はトンネルあたりの同時TCP接続数の上限。
+const maxConnsPerTunnel = 100
+
 // acceptTCP は指定リスナーでTCP接続を受け付け、それぞれgoroutineで処理する。
+// 同時接続数をmaxConnsPerTunnelで制限する。
 func (s *Server) acceptTCP(ctx context.Context, listener net.Listener, t *tunnel) {
+	sem := make(chan struct{}, maxConnsPerTunnel)
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -455,7 +445,16 @@ func (s *Server) acceptTCP(ctx context.Context, listener net.Listener, t *tunnel
 			}
 		}
 
-		go s.handleTCPConn(conn, t)
+		select {
+		case sem <- struct{}{}:
+			go func() {
+				defer func() { <-sem }()
+				s.handleTCPConn(conn, t)
+			}()
+		default:
+			log.Printf("[server] connection limit reached (port %d), rejecting", t.publicPort)
+			conn.Close()
+		}
 	}
 }
 
